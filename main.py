@@ -83,6 +83,17 @@ Return JSON only: {"topics":[{"topic":"string","importance":1-5}]}
 Keep topics short and concrete.
 """.strip()
 
+STICKER_QUERY_SYSTEM_PROMPT = """
+You rewrite user text into a short sticker-search keyword.
+Return JSON only: {"keyword":"..."}.
+Rules:
+- Keep keyword 1-4 words.
+- Prefer expressive reaction keywords for stickers.
+- If the user asks factual/math/knowledge questions, use playful uncertainty keywords like "idk", "confused", or "shrug".
+- Preserve the user's language when possible.
+- Keep output plain and concise.
+""".strip()
+
 
 # -------- DB --------
 
@@ -835,10 +846,39 @@ def search_klipy_stickers(query: str) -> list[str]:
     return candidates
 
 
+def build_sticker_search_keyword(user_query: str) -> str:
+    raw = sanitize_text(user_query)
+    if not raw:
+        return ""
+    try:
+        config = types.GenerateContentConfig(
+            system_instruction=STICKER_QUERY_SYSTEM_PROMPT,
+            response_mime_type="application/json",
+        )
+        resp = client.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=json.dumps({"user_query": raw}, ensure_ascii=False),
+            config=config,
+        )
+        parsed = json.loads((resp.text or "{}").strip())
+        keyword = sanitize_text(parsed.get("keyword") or "")
+        if keyword:
+            return keyword[:80]
+    except Exception:
+        app.logger.exception("Sticker keyword rewrite failed; fallback to raw")
+    return raw[:80]
+
+
 def send_sticker_reply(reply_to_message_id: str, chat_id: str, query: str):
-    sticker_urls = search_klipy_stickers(query)
+    sticker_query = build_sticker_search_keyword(query)
+    if not sticker_query:
+        app.logger.info("No sticker keyword for query=%s", query)
+        return
+    app.logger.info("Sticker keyword rewritten: raw=%s rewritten=%s", query, sticker_query)
+
+    sticker_urls = search_klipy_stickers(sticker_query)
     if not sticker_urls:
-        app.logger.info("No sticker result for query=%s", query)
+        app.logger.info("No sticker result for query=%s rewritten=%s", query, sticker_query)
         return
 
     for idx, sticker_url in enumerate(sticker_urls[:8], start=1):
@@ -861,14 +901,14 @@ def send_sticker_reply(reply_to_message_id: str, chat_id: str, query: str):
                 continue
             msg_id = send_lark_image_reply(reply_to_message_id, image_key)
             remember_bot_message(msg_id, chat_id)
-            save_bot_text(chat_id, f"[sticker] {query}", None, reply_to_message_id)
-            app.logger.info("Sticker reply sent for query=%s candidate=%s", query, idx)
+            save_bot_text(chat_id, f"[sticker] {query} -> {sticker_query}", None, reply_to_message_id)
+            app.logger.info("Sticker reply sent for query=%s rewritten=%s candidate=%s", query, sticker_query, idx)
             return
         except Exception:
             app.logger.exception("Sticker reply candidate failed url=%s", sticker_url)
             continue
 
-    app.logger.info("All sticker candidates failed for query=%s", query)
+    app.logger.info("All sticker candidates failed for query=%s rewritten=%s", query, sticker_query)
     return
 
 
