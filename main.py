@@ -1043,16 +1043,9 @@ def should_respond(message: dict, content_obj: dict, normalized_text: str) -> tu
     raw_text = content_obj.get("text") or ""
     segments = extract_bot_segments(raw_text, mentions)
 
-    parent_id = message.get("parent_id")
-    root_id = message.get("root_id")
-    replied = is_reply_to_bot(parent_id, root_id)
-
     if segments:
         return True, segments
     if mentions and re.search(r"\bsticksy\b", (raw_text or normalized_text or ""), re.IGNORECASE):
-        fallback = sanitize_text(normalized_text or raw_text)
-        return (True, [fallback] if fallback else [])
-    if replied:
         fallback = sanitize_text(normalized_text or raw_text)
         return (True, [fallback] if fallback else [])
     return False, []
