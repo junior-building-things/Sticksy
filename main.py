@@ -829,14 +829,10 @@ def create_summary(query: str, asker_name: str, language_hint: str, rows: list[d
     topics = parsed.get("topics") or []
     bullets = []
     for t in topics:
-        title = (t.get("title") or "").strip()
         summary = (t.get("summary") or "").strip()
         if not summary:
             continue
-        if title:
-            bullets.append(f"- {title}: {summary}")
-        else:
-            bullets.append(f"- {summary}")
+        bullets.append(f"- {summary}")
 
     if window_label == "today":
         first_line = "Summary of today's conversation:"
