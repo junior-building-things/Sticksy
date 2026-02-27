@@ -834,8 +834,31 @@ def create_summary(query: str, asker_name: str, language_hint: str, rows: list[d
         else:
             bullets.append(f"- {summary}")
 
+    low_content_markers = [
+        "hasn't been significant conversation",
+        "nothing to summarize",
+        "no significant conversation",
+        "no major discussion points",
+        "chat is empty",
+    ]
+    intro_lc = intro.lower()
+    if any(m in intro_lc for m in low_content_markers):
+        intro = ""
+
     if not bullets:
-        bullets = ["- No major discussion points found."]
+        # Forced summary fallback: always synthesize concise bullets from available lines.
+        fallback_lines = []
+        for line in message_lines[-6:]:
+            fallback_lines.append(line)
+        if fallback_lines:
+            bullets = [
+                "- Conversation activity: Participants exchanged short updates and reactions.",
+                f"- Recent points: {' | '.join(fallback_lines[:3])}",
+            ]
+            if len(fallback_lines) > 3:
+                bullets.append(f"- Additional context: {' | '.join(fallback_lines[3:6])}")
+        else:
+            bullets = ["- Conversation activity: Short exchanges occurred in this time window."]
 
     if window_label == "today":
         first_line = "Summary of today's conversation:"
