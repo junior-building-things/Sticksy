@@ -846,8 +846,6 @@ def create_summary(query: str, asker_name: str, language_hint: str, rows: list[d
         first_line = f"Summary of {window_label} conversation:"
 
     summary_parts = [first_line]
-    if intro:
-        summary_parts.append(intro)
     if bullets:
         summary_parts.append("\n".join(bullets))
     summary_text = "\n".join(summary_parts)
