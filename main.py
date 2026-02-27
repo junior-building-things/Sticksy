@@ -779,9 +779,18 @@ def load_messages_for_window(chat_id: str, start_ts: int, end_ts: int, root_id: 
 def create_summary(query: str, asker_name: str, language_hint: str, rows: list[dict], window_label: str) -> tuple[str, list[str]]:
     message_lines = []
     image_pool = []
+    speaker_cache: dict[str, str] = {}
     for row in rows:
         ts = datetime.fromtimestamp(int(row["created_at_ts"]), tz=timezone.utc).strftime("%H:%M")
-        speaker = row["sender_name"] or "Unknown"
+        speaker = (row.get("sender_name") or "").strip()
+        sender_open_id = (row.get("sender_open_id") or "").strip()
+        if (not speaker or speaker.lower() == "unknown") and sender_open_id:
+            if sender_open_id not in speaker_cache:
+                profile = get_user_profile(sender_open_id)
+                speaker_cache[sender_open_id] = (profile.get("display_name") or "").strip()
+            speaker = speaker_cache.get(sender_open_id) or speaker
+        if not speaker:
+            speaker = "Unknown"
         if row["message_type"] == "text":
             text = (row["text_content"] or "").strip()
             if text:
