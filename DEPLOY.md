@@ -57,3 +57,12 @@ Monitor dashboard:
 - If Klipy returns no sticker or API errors, Sticksy will stay silent by design.
 - If Gemini/Lark errors occur, Sticksy will stay silent for summary/sticker failures by design.
 - Free Render web services do not support persistent disks, so use `DATABASE_URL` for durable chat history.
+
+## Clear history (admin)
+Set `ADMIN_API_KEY` in Render, then call:
+
+- Clear all history:
+  `curl -X POST https://<render-service>.onrender.com/admin/clear-history -H "X-Admin-Key: <ADMIN_API_KEY>"`
+
+- Clear one chat only:
+  `curl -X POST https://<render-service>.onrender.com/admin/clear-history -H "Content-Type: application/json" -H "X-Admin-Key: <ADMIN_API_KEY>" -d '{"chat_id":"oc_xxx"}'`

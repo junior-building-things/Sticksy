@@ -33,6 +33,7 @@ KLIPY_SEARCH_URL = os.environ.get("KLIPY_SEARCH_URL", "https://api.klipy.com/v1/
 THOMAS_OPEN_ID = os.environ.get("THOMAS_OPEN_ID", "")
 THOMAS_DISPLAY_NAME = os.environ.get("THOMAS_DISPLAY_NAME", "Thomas")
 RETENTION_DAYS = int(os.environ.get("RETENTION_DAYS", "30"))
+ADMIN_API_KEY = os.environ.get("ADMIN_API_KEY", "")
 DATABASE_PATH = os.environ.get("DATABASE_PATH", "sticksy.db")
 DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
 if not DATABASE_URL:
@@ -1337,6 +1338,35 @@ def monitor_groups():
 @app.route("/healthz", methods=["GET"])
 def healthz():
     return jsonify({"ok": True, "model": GEMINI_MODEL, "retention_days": RETENTION_DAYS})
+
+
+@app.route("/admin/clear-history", methods=["POST"])
+def admin_clear_history():
+    if not ADMIN_API_KEY:
+        return jsonify({"ok": False, "error": "ADMIN_API_KEY is not configured"}), 403
+
+    provided = request.headers.get("X-Admin-Key", "")
+    if provided != ADMIN_API_KEY:
+        return jsonify({"ok": False, "error": "Unauthorized"}), 401
+
+    body = request.get_json(silent=True) or {}
+    chat_id = (body.get("chat_id") or "").strip()
+
+    if chat_id:
+        db_execute("DELETE FROM messages WHERE chat_id = :chat_id", {"chat_id": chat_id})
+        db_execute("DELETE FROM bot_messages WHERE chat_id = :chat_id", {"chat_id": chat_id})
+        db_execute("DELETE FROM topic_cache WHERE chat_id = :chat_id", {"chat_id": chat_id})
+        app.logger.warning("Admin cleared history for chat_id=%s", chat_id)
+        return jsonify({"ok": True, "scope": "chat", "chat_id": chat_id})
+
+    db_execute("DELETE FROM messages", {})
+    db_execute("DELETE FROM bot_messages", {})
+    db_execute("DELETE FROM processed_events", {})
+    db_execute("DELETE FROM topic_cache", {})
+    db_execute("DELETE FROM user_timezone_cache", {})
+    db_execute("DELETE FROM user_profile_cache", {})
+    app.logger.warning("Admin cleared all history")
+    return jsonify({"ok": True, "scope": "all"})
 
 
 @app.route("/debug/echo", methods=["GET", "POST"])
