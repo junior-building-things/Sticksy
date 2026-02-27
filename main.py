@@ -838,36 +838,6 @@ def create_summary(query: str, asker_name: str, language_hint: str, rows: list[d
         else:
             bullets.append(f"- {summary}")
 
-    low_content_markers = [
-        "hasn't been significant conversation",
-        "nothing to summarize",
-        "no significant conversation",
-        "no major discussion points",
-        "chat is empty",
-    ]
-    intro_lc = intro.lower()
-    if any(m in intro_lc for m in low_content_markers):
-        intro = ""
-
-    if not bullets:
-        # Forced summary fallback: always synthesize concise bullets from available lines.
-        text_count = sum(1 for r in rows if (r.get("message_type") == "text" and (r.get("text_content") or "").strip()))
-        image_count = sum(1 for r in rows if (r.get("message_type") == "image" and (r.get("image_key") or "").strip()))
-        unique_speakers = {
-            ((r.get("sender_name") or "").strip() or "participant")
-            for r in rows
-            if (r.get("sender_name") or "").strip()
-        }
-        if rows:
-            bullets = [
-                f"- Conversation activity: {len(unique_speakers) or 1} participants exchanged {text_count} text messages and {image_count} images.",
-                "- Main takeaway: The chat included short interactions and lightweight back-and-forth updates.",
-            ]
-            if image_count > 0:
-                bullets.append("- Visual context: Shared images contributed additional context to the discussion.")
-        else:
-            bullets = ["- Conversation activity: Short exchanges occurred in this time window."]
-
     if window_label == "today":
         first_line = "Summary of today's conversation:"
     elif window_label == "yesterday":
@@ -875,10 +845,12 @@ def create_summary(query: str, asker_name: str, language_hint: str, rows: list[d
     else:
         first_line = f"Summary of {window_label} conversation:"
 
+    summary_parts = [first_line]
     if intro:
-        summary_text = f"{first_line}\n{intro}\n" + "\n".join(bullets)
-    else:
-        summary_text = f"{first_line}\n" + "\n".join(bullets)
+        summary_parts.append(intro)
+    if bullets:
+        summary_parts.append("\n".join(bullets))
+    summary_text = "\n".join(summary_parts)
 
     image_candidates = parsed.get("important_image_keys") or []
     selected = []
