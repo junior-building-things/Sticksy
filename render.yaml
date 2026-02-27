@@ -1,0 +1,10 @@
+services:
+  - type: web
+    name: sticksy
+    env: docker
+    autoDeploy: true
+    healthCheckPath: /healthz
+    disk:
+      name: sticksy-data
+      mountPath: /var/data
+      sizeGB: 1
