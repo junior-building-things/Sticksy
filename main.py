@@ -91,7 +91,7 @@ Generate a concise sticker search query from the user's message. The query will 
 Return JSON only: {"query":"..."}.
 Rules:
 - Use the recent chat context to infer tone and intent before generating the query.
-- The query should serve as a fun reply to the user's message (e.g. if they say "hi", the query can be "hi there", if they say "are you there", the query can be "hiding")
+- The query should serve as a fun and cheeky reply to the user's message. Add a playful twist where possible.
 - Preserve the user's language when possible.
 - Keep the query 1-4 words.
 """.strip()
