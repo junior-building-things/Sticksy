@@ -457,15 +457,16 @@ def save_incoming_message(
     )
 
 
-def save_bot_text(chat_id: str, text: str, root_id: str | None, parent_id: str | None):
+def save_bot_text(chat_id: str, text: str, root_id: str | None, parent_id: str | None, event_message_id: str | None = None):
     db_execute(
         """
         INSERT INTO messages(
           event_message_id, chat_id, chat_name, sender_open_id, sender_name, is_from_bot,
           message_type, text_content, image_key, root_id, parent_id, created_at_ts
-        ) VALUES(NULL, :chat_id, '', '', 'Sticksy', 1, 'text', :text, '', :root_id, :parent_id, :created_at_ts)
+        ) VALUES(:event_message_id, :chat_id, '', '', 'Sticksy', 1, 'text', :text, '', :root_id, :parent_id, :created_at_ts)
         """,
         {
+            "event_message_id": event_message_id,
             "chat_id": chat_id,
             "text": text,
             "root_id": root_id or "",
@@ -483,6 +484,18 @@ def is_reply_to_bot(parent_id: str | None, root_id: str | None) -> bool:
         {"parent_id": parent_id or "", "root_id": root_id or ""},
     )
     if row is not None:
+        return True
+
+    row2 = db_query_one(
+        """
+        SELECT 1
+        FROM messages
+        WHERE is_from_bot = 1 AND (event_message_id = :parent_id OR event_message_id = :root_id)
+        LIMIT 1
+        """,
+        {"parent_id": parent_id or "", "root_id": root_id or ""},
+    )
+    if row2 is not None:
         return True
 
     # Fallback: check Lark message metadata directly in case local cache missed a bot message id.
@@ -855,7 +868,7 @@ def send_missing_history_message(reply_to_message_id: str, chat_id: str):
         mention_name=THOMAS_DISPLAY_NAME,
     )
     remember_bot_message(msg_id, chat_id)
-    save_bot_text(chat_id, text, None, reply_to_message_id)
+    save_bot_text(chat_id, text, None, reply_to_message_id, event_message_id=msg_id)
 
 
 def looks_like_cjk(text: str) -> bool:
@@ -1014,7 +1027,7 @@ def send_sticker_reply(reply_to_message_id: str, chat_id: str, query: str):
                 continue
             msg_id = send_lark_image_reply(reply_to_message_id, image_key)
             remember_bot_message(msg_id, chat_id)
-            save_bot_text(chat_id, f"[sticker] {query} -> {sticker_query}", None, reply_to_message_id)
+            save_bot_text(chat_id, f"[sticker] {query} -> {sticker_query}", None, reply_to_message_id, event_message_id=msg_id)
             app.logger.info("Sticker reply sent for query=%s rewritten=%s candidate=%s", query, sticker_query, idx)
             return
         except Exception:
@@ -1036,7 +1049,7 @@ def should_respond(message: dict, content_obj: dict, normalized_text: str) -> tu
 
     if segments:
         return True, segments
-    if mentions and re.search(r"\\bsticksy\\b", (raw_text or normalized_text or ""), re.IGNORECASE):
+    if mentions and re.search(r"\bsticksy\b", (raw_text or normalized_text or ""), re.IGNORECASE):
         fallback = sanitize_text(normalized_text or raw_text)
         return (True, [fallback] if fallback else [])
     if replied:
@@ -1256,7 +1269,7 @@ def webhook():
                     mention_name=sender_name,
                 )
                 remember_bot_message(msg_id, chat_id)
-                save_bot_text(chat_id, summary_text, root_id, message_id)
+                save_bot_text(chat_id, summary_text, root_id, message_id, event_message_id=msg_id)
 
                 for key in image_keys[:MAX_SUMMARY_IMAGES]:
                     try:
