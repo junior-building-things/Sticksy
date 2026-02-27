@@ -361,9 +361,13 @@ def upload_lark_image(image_bytes: bytes, filename: str = "sticker.gif") -> str 
         timeout=HTTP_TIMEOUT,
     )
     if resp.status_code >= 400:
+        app.logger.warning("Lark image upload HTTP error status=%s body=%s", resp.status_code, resp.text[:300])
         return None
     body = resp.json()
-    return ((body.get("data") or {}).get("image_key"))
+    if body.get("code", 0) != 0:
+        app.logger.warning("Lark image upload API error code=%s msg=%s", body.get("code"), body.get("msg"))
+        return None
+    return (body.get("data") or {}).get("image_key")
 
 
 def remember_bot_message(message_id: str | None, chat_id: str):
@@ -758,7 +762,8 @@ def extract_media_url_from_tenor_like(data: dict) -> str | None:
         return None
     first = results[0] or {}
     media_formats = first.get("media_formats") or {}
-    preferred_order = ["gif", "tinygif", "nanogif", "mediumgif", "webp", "tinywebp"]
+    # Prefer smaller variants first to satisfy Lark image upload limits.
+    preferred_order = ["tinygif", "nanogif", "gif", "mediumgif", "tinywebp", "webp"]
     for key in preferred_order:
         candidate = media_formats.get(key) or {}
         url = candidate.get("url")
