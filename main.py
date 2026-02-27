@@ -459,29 +459,58 @@ def sanitize_text(s: str) -> str:
     return text
 
 
+def mention_open_id(mention: dict) -> str:
+    return ((mention.get("id") or {}).get("open_id")) or ""
+
+
+def is_bot_mention(mention: dict) -> bool:
+    open_id = mention_open_id(mention)
+    if LARK_BOT_OPEN_ID:
+        return open_id == LARK_BOT_OPEN_ID
+    # Fallback when bot open_id is not configured: treat any mention as bot mention.
+    return True
+
+
 def extract_bot_segments(raw_text: str, mentions: list[dict]) -> list[str]:
     if not raw_text:
         return []
 
     tokens = list(re.finditer(r"@_user_\d+", raw_text))
+    bot_mentions = [m for m in mentions if is_bot_mention(m)]
+
     if not tokens:
-        if any(((m.get("id") or {}).get("open_id") == LARK_BOT_OPEN_ID) for m in mentions):
+        if bot_mentions:
             t = sanitize_text(raw_text)
             return [t] if t else []
         return []
 
+    mention_by_key = {}
+    for m in mentions:
+        key = m.get("key")
+        if isinstance(key, str) and key:
+            mention_by_key[key] = m
+
     segments = []
+    bot_token_count = 0
     for i, token in enumerate(tokens):
-        mention = mentions[i] if i < len(mentions) else {}
-        mentioned_open_id = ((mention.get("id") or {}).get("open_id"))
-        if mentioned_open_id != LARK_BOT_OPEN_ID:
+        mention = mention_by_key.get(token.group(0))
+        if not mention and i < len(mentions):
+            mention = mentions[i]
+        if not mention or not is_bot_mention(mention):
             continue
+        bot_token_count += 1
 
         start = token.end()
         end = tokens[i + 1].start() if i + 1 < len(tokens) else len(raw_text)
         seg = sanitize_text(raw_text[start:end])
         if seg:
             segments.append(seg)
+
+    if not segments and bot_token_count == 1:
+        # Support patterns like "Hi @Sticksy" where user text appears before the mention.
+        cleaned = sanitize_text(re.sub(r"@_user_\d+", "", raw_text))
+        if cleaned:
+            segments.append(cleaned)
 
     return segments
 
