@@ -42,6 +42,7 @@ HTTP_TIMEOUT = 12
 MAX_SUMMARY_IMAGES = 3
 MAX_SUMMARY_MESSAGES = 350
 TOPIC_WINDOW_HOURS = 6
+MAX_STICKER_UPLOAD_BYTES = int(os.environ.get("MAX_STICKER_UPLOAD_BYTES", "9500000"))
 
 client = genai.Client(api_key=GEMINI_API_KEY)
 
@@ -756,39 +757,52 @@ def find_first_media_url(obj):
     return None
 
 
-def extract_media_url_from_tenor_like(data: dict) -> str | None:
+def extract_media_urls_from_tenor_like(data: dict, max_results: int = 8) -> list[str]:
     results = data.get("results")
     if not isinstance(results, list) or not results:
-        return None
-    first = results[0] or {}
-    media_formats = first.get("media_formats") or {}
+        return []
+    out = []
     # Prefer smaller variants first to satisfy Lark image upload limits.
     preferred_order = ["tinygif", "nanogif", "gif", "mediumgif", "tinywebp", "webp"]
-    for key in preferred_order:
-        candidate = media_formats.get(key) or {}
-        url = candidate.get("url")
-        if isinstance(url, str) and url.startswith(("http://", "https://")):
-            return url
-    return find_first_media_url(first)
+    for item in results[:max_results]:
+        media_formats = (item or {}).get("media_formats") or {}
+        for key in preferred_order:
+            candidate = media_formats.get(key) or {}
+            url = candidate.get("url")
+            if isinstance(url, str) and url.startswith(("http://", "https://")) and url not in out:
+                out.append(url)
+        fallback = find_first_media_url(item)
+        if fallback and fallback not in out:
+            out.append(fallback)
+    return out
 
 
-def search_klipy_sticker(query: str) -> str | None:
+def search_klipy_stickers(query: str) -> list[str]:
     if not KLIPY_API_KEY:
-        return None
+        return []
+
+    candidates: list[str] = []
+    seen = set()
+
+    def add_candidates(urls: list[str]):
+        for u in urls:
+            if u and u not in seen:
+                seen.add(u)
+                candidates.append(u)
 
     # Strategy 1: Tenor-compatible search endpoint used by KLIPY migration docs.
     try:
         resp = requests.get(
             "https://api.klipy.com/v2/search",
-            params={"q": query, "key": KLIPY_API_KEY, "limit": 1, "media_filter": "gif"},
+            params={"q": query, "key": KLIPY_API_KEY, "limit": 10, "media_filter": "gif"},
             timeout=HTTP_TIMEOUT,
         )
         if resp.status_code < 400:
             data = resp.json()
-            url = extract_media_url_from_tenor_like(data)
-            if url:
-                app.logger.info("Klipy sticker found via /v2/search")
-                return url
+            urls = extract_media_urls_from_tenor_like(data, max_results=10)
+            if urls:
+                add_candidates(urls)
+                app.logger.info("Klipy stickers found via /v2/search count=%s", len(urls))
         else:
             app.logger.warning("Klipy /v2/search failed status=%s body=%s", resp.status_code, resp.text[:200])
     except Exception:
@@ -801,45 +815,61 @@ def search_klipy_sticker(query: str) -> str | None:
         "X-KLIPY-API-KEY": KLIPY_API_KEY,
         "Content-Type": "application/json",
     }
-    payload = {"query": query, "q": query, "limit": 1}
+    payload = {"query": query, "q": query, "limit": 10}
     try:
         resp = requests.post(KLIPY_SEARCH_URL, headers=headers, json=payload, timeout=HTTP_TIMEOUT)
         if resp.status_code < 400:
             data = resp.json()
-            url = extract_media_url_from_tenor_like(data) or find_first_media_url(data)
-            if url:
-                app.logger.info("Klipy sticker found via configured URL")
-                return url
+            urls = extract_media_urls_from_tenor_like(data, max_results=10)
+            if not urls:
+                single = find_first_media_url(data)
+                urls = [single] if single else []
+            if urls:
+                add_candidates(urls)
+                app.logger.info("Klipy stickers found via configured URL count=%s", len(urls))
         else:
             app.logger.warning("Klipy configured URL failed status=%s body=%s", resp.status_code, resp.text[:200])
     except Exception:
         app.logger.exception("Klipy configured URL request error")
 
-    return None
+    return candidates
 
 
 def send_sticker_reply(reply_to_message_id: str, chat_id: str, query: str):
-    sticker_url = search_klipy_sticker(query)
-    if not sticker_url:
+    sticker_urls = search_klipy_stickers(query)
+    if not sticker_urls:
         app.logger.info("No sticker result for query=%s", query)
         return
 
-    try:
-        media = requests.get(sticker_url, timeout=HTTP_TIMEOUT)
-        if media.status_code >= 400:
-            app.logger.warning("Sticker media download failed status=%s url=%s", media.status_code, sticker_url)
+    for idx, sticker_url in enumerate(sticker_urls[:8], start=1):
+        try:
+            media = requests.get(sticker_url, timeout=HTTP_TIMEOUT)
+            if media.status_code >= 400:
+                app.logger.warning("Sticker media download failed status=%s url=%s", media.status_code, sticker_url)
+                continue
+            content_length = int(media.headers.get("Content-Length") or 0)
+            if content_length and content_length > MAX_STICKER_UPLOAD_BYTES:
+                app.logger.info("Sticker candidate too large via header size=%s url=%s", content_length, sticker_url)
+                continue
+            payload = media.content
+            if len(payload) > MAX_STICKER_UPLOAD_BYTES:
+                app.logger.info("Sticker candidate too large via body size=%s url=%s", len(payload), sticker_url)
+                continue
+            image_key = upload_lark_image(payload)
+            if not image_key:
+                app.logger.warning("Lark image upload failed for sticker_url=%s", sticker_url)
+                continue
+            msg_id = send_lark_image_reply(reply_to_message_id, image_key)
+            remember_bot_message(msg_id, chat_id)
+            save_bot_text(chat_id, f"[sticker] {query}", None, reply_to_message_id)
+            app.logger.info("Sticker reply sent for query=%s candidate=%s", query, idx)
             return
-        image_key = upload_lark_image(media.content)
-        if not image_key:
-            app.logger.warning("Lark image upload failed for sticker_url=%s", sticker_url)
-            return
-        msg_id = send_lark_image_reply(reply_to_message_id, image_key)
-        remember_bot_message(msg_id, chat_id)
-        save_bot_text(chat_id, f"[sticker] {query}", None, reply_to_message_id)
-        app.logger.info("Sticker reply sent for query=%s", query)
-    except Exception:
-        app.logger.exception("Sticker reply pipeline failed")
-        return
+        except Exception:
+            app.logger.exception("Sticker reply candidate failed url=%s", sticker_url)
+            continue
+
+    app.logger.info("All sticker candidates failed for query=%s", query)
+    return
 
 
 def should_respond(message: dict, content_obj: dict) -> tuple[bool, list[str]]:
