@@ -17,6 +17,7 @@ Copy from `.env.example` and fill real values:
 - `LARK_BOT_OPEN_ID` (`ou_32bdd3b66534e18bdd7bc490c075584e`)
 - `KLIPY_API_KEY`
 - `KLIPY_SEARCH_URL` (keep if correct)
+- `DATABASE_URL` (managed Postgres URL from Neon/Supabase/Render Postgres)
 
 Optional:
 - `LARK_VERIFICATION_TOKEN`
@@ -24,7 +25,7 @@ Optional:
 - `THOMAS_OPEN_ID`
 - `THOMAS_DISPLAY_NAME`
 - `RETENTION_DAYS` (default `30`)
-- `DATABASE_PATH=/var/data/sticksy.db`
+- `DATABASE_PATH` (local dev fallback only; ignored when `DATABASE_URL` is set)
 
 ## 4. Get your public webhook URL
 After deploy, your base URL will look like:
@@ -55,3 +56,4 @@ Monitor dashboard:
 ## Notes
 - If Klipy returns no sticker or API errors, Sticksy will stay silent by design.
 - If Gemini/Lark errors occur, Sticksy will stay silent for summary/sticker failures by design.
+- Free Render web services do not support persistent disks, so use `DATABASE_URL` for durable chat history.

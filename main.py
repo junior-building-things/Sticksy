@@ -1,7 +1,6 @@
 import json
 import os
 import re
-import sqlite3
 import threading
 import time
 import hashlib
@@ -14,6 +13,8 @@ import requests
 from flask import Flask, jsonify, request, Response
 from google import genai
 from google.genai import types
+from sqlalchemy import create_engine, text
+from sqlalchemy.exc import IntegrityError
 
 
 app = Flask(__name__)
@@ -33,6 +34,9 @@ THOMAS_OPEN_ID = os.environ.get("THOMAS_OPEN_ID", "")
 THOMAS_DISPLAY_NAME = os.environ.get("THOMAS_DISPLAY_NAME", "Thomas")
 RETENTION_DAYS = int(os.environ.get("RETENTION_DAYS", "30"))
 DATABASE_PATH = os.environ.get("DATABASE_PATH", "sticksy.db")
+DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
+if not DATABASE_URL:
+    DATABASE_URL = f"sqlite:///{DATABASE_PATH}"
 
 HTTP_TIMEOUT = 12
 MAX_SUMMARY_IMAGES = 3
@@ -81,19 +85,87 @@ Keep topics short and concrete.
 
 # -------- DB --------
 
+ENGINE = create_engine(
+    DATABASE_URL,
+    pool_pre_ping=True,
+    future=True,
+    connect_args={"check_same_thread": False} if DATABASE_URL.startswith("sqlite") else {},
+)
+IS_POSTGRES = ENGINE.dialect.name.startswith("postgres")
 
-def get_db():
-    conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
-    conn.row_factory = sqlite3.Row
-    return conn
+
+def db_execute(query: str, params: dict | None = None):
+    with _db_lock:
+        with ENGINE.begin() as conn:
+            conn.execute(text(query), params or {})
 
 
-DB = get_db()
+def db_query_all(query: str, params: dict | None = None) -> list[dict]:
+    with _db_lock:
+        with ENGINE.connect() as conn:
+            rows = conn.execute(text(query), params or {}).mappings().all()
+            return [dict(r) for r in rows]
+
+
+def db_query_one(query: str, params: dict | None = None) -> dict | None:
+    with _db_lock:
+        with ENGINE.connect() as conn:
+            row = conn.execute(text(query), params or {}).mappings().first()
+            return dict(row) if row else None
 
 
 def init_db():
-    with _db_lock:
-        DB.executescript(
+    if IS_POSTGRES:
+        schema_sql = [
+            """
+            CREATE TABLE IF NOT EXISTS messages (
+              id BIGSERIAL PRIMARY KEY,
+              event_message_id TEXT,
+              chat_id TEXT NOT NULL,
+              chat_name TEXT,
+              sender_open_id TEXT,
+              sender_name TEXT,
+              is_from_bot INTEGER NOT NULL DEFAULT 0,
+              message_type TEXT NOT NULL,
+              text_content TEXT,
+              image_key TEXT,
+              root_id TEXT,
+              parent_id TEXT,
+              created_at_ts BIGINT NOT NULL
+            )
+            """,
+            "CREATE INDEX IF NOT EXISTS idx_messages_chat_time ON messages(chat_id, created_at_ts DESC)",
+            "CREATE INDEX IF NOT EXISTS idx_messages_root_time ON messages(root_id, created_at_ts DESC)",
+            """
+            CREATE TABLE IF NOT EXISTS processed_events (
+              event_id TEXT PRIMARY KEY,
+              created_at_ts BIGINT NOT NULL
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS bot_messages (
+              message_id TEXT PRIMARY KEY,
+              chat_id TEXT NOT NULL,
+              created_at_ts BIGINT NOT NULL
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS topic_cache (
+              chat_id TEXT PRIMARY KEY,
+              topics_json TEXT NOT NULL,
+              computed_at_ts BIGINT NOT NULL
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS user_timezone_cache (
+              open_id TEXT PRIMARY KEY,
+              tz_name TEXT NOT NULL,
+              cached_at_ts BIGINT NOT NULL
+            )
+            """,
+        ]
+    else:
+        schema_sql = [
             """
             CREATE TABLE IF NOT EXISTS messages (
               id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -109,36 +181,41 @@ def init_db():
               root_id TEXT,
               parent_id TEXT,
               created_at_ts INTEGER NOT NULL
-            );
-
-            CREATE INDEX IF NOT EXISTS idx_messages_chat_time ON messages(chat_id, created_at_ts DESC);
-            CREATE INDEX IF NOT EXISTS idx_messages_root_time ON messages(root_id, created_at_ts DESC);
-
+            )
+            """,
+            "CREATE INDEX IF NOT EXISTS idx_messages_chat_time ON messages(chat_id, created_at_ts DESC)",
+            "CREATE INDEX IF NOT EXISTS idx_messages_root_time ON messages(root_id, created_at_ts DESC)",
+            """
             CREATE TABLE IF NOT EXISTS processed_events (
               event_id TEXT PRIMARY KEY,
               created_at_ts INTEGER NOT NULL
-            );
-
+            )
+            """,
+            """
             CREATE TABLE IF NOT EXISTS bot_messages (
               message_id TEXT PRIMARY KEY,
               chat_id TEXT NOT NULL,
               created_at_ts INTEGER NOT NULL
-            );
-
+            )
+            """,
+            """
             CREATE TABLE IF NOT EXISTS topic_cache (
               chat_id TEXT PRIMARY KEY,
               topics_json TEXT NOT NULL,
               computed_at_ts INTEGER NOT NULL
-            );
-
+            )
+            """,
+            """
             CREATE TABLE IF NOT EXISTS user_timezone_cache (
               open_id TEXT PRIMARY KEY,
               tz_name TEXT NOT NULL,
               cached_at_ts INTEGER NOT NULL
-            );
-            """
-        )
-        DB.commit()
+            )
+            """,
+        ]
+
+    for stmt in schema_sql:
+        db_execute(stmt)
 
 
 init_db()
@@ -157,13 +234,11 @@ def maybe_sweep_retention():
     if current - _last_retention_sweep < 3600:
         return
     cutoff = now_ts() - RETENTION_DAYS * 24 * 3600
-    with _db_lock:
-        DB.execute("DELETE FROM messages WHERE created_at_ts < ?", (cutoff,))
-        DB.execute("DELETE FROM bot_messages WHERE created_at_ts < ?", (cutoff,))
-        DB.execute("DELETE FROM processed_events WHERE created_at_ts < ?", (cutoff,))
-        DB.execute("DELETE FROM topic_cache WHERE computed_at_ts < ?", (cutoff,))
-        DB.execute("DELETE FROM user_timezone_cache WHERE cached_at_ts < ?", (cutoff,))
-        DB.commit()
+    db_execute("DELETE FROM messages WHERE created_at_ts < :cutoff", {"cutoff": cutoff})
+    db_execute("DELETE FROM bot_messages WHERE created_at_ts < :cutoff", {"cutoff": cutoff})
+    db_execute("DELETE FROM processed_events WHERE created_at_ts < :cutoff", {"cutoff": cutoff})
+    db_execute("DELETE FROM topic_cache WHERE computed_at_ts < :cutoff", {"cutoff": cutoff})
+    db_execute("DELETE FROM user_timezone_cache WHERE cached_at_ts < :cutoff", {"cutoff": cutoff})
     _last_retention_sweep = current
 
 
@@ -200,16 +275,14 @@ def verify_lark_request(raw_body: bytes, payload: dict) -> tuple[bool, str]:
 def record_event_once(event_id: str | None) -> bool:
     if not event_id:
         return True
-    with _db_lock:
-        try:
-            DB.execute(
-                "INSERT INTO processed_events(event_id, created_at_ts) VALUES(?, ?)",
-                (event_id, now_ts()),
-            )
-            DB.commit()
-            return True
-        except sqlite3.IntegrityError:
-            return False
+    try:
+        db_execute(
+            "INSERT INTO processed_events(event_id, created_at_ts) VALUES(:event_id, :created_at_ts)",
+            {"event_id": event_id, "created_at_ts": now_ts()},
+        )
+        return True
+    except IntegrityError:
+        return False
 
 
 def get_tenant_access_token() -> str:
@@ -296,12 +369,21 @@ def upload_lark_image(image_bytes: bytes, filename: str = "sticker.gif") -> str 
 def remember_bot_message(message_id: str | None, chat_id: str):
     if not message_id:
         return
-    with _db_lock:
-        DB.execute(
-            "INSERT OR REPLACE INTO bot_messages(message_id, chat_id, created_at_ts) VALUES(?, ?, ?)",
-            (message_id, chat_id, now_ts()),
+    if IS_POSTGRES:
+        db_execute(
+            """
+            INSERT INTO bot_messages(message_id, chat_id, created_at_ts)
+            VALUES(:message_id, :chat_id, :created_at_ts)
+            ON CONFLICT (message_id) DO UPDATE
+            SET chat_id = EXCLUDED.chat_id, created_at_ts = EXCLUDED.created_at_ts
+            """,
+            {"message_id": message_id, "chat_id": chat_id, "created_at_ts": now_ts()},
         )
-        DB.commit()
+    else:
+        db_execute(
+            "INSERT OR REPLACE INTO bot_messages(message_id, chat_id, created_at_ts) VALUES(:message_id, :chat_id, :created_at_ts)",
+            {"message_id": message_id, "chat_id": chat_id, "created_at_ts": now_ts()},
+        )
 
 
 def save_incoming_message(
@@ -318,53 +400,55 @@ def save_incoming_message(
     parent_id: str,
     created_at_ts: int,
 ):
-    with _db_lock:
-        DB.execute(
-            """
-            INSERT INTO messages(
-              event_message_id, chat_id, chat_name, sender_open_id, sender_name, is_from_bot,
-              message_type, text_content, image_key, root_id, parent_id, created_at_ts
-            ) VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                event_message_id,
-                chat_id,
-                chat_name,
-                sender_open_id,
-                sender_name,
-                message_type,
-                text_content,
-                image_key,
-                root_id,
-                parent_id,
-                created_at_ts,
-            ),
-        )
-        DB.commit()
+    db_execute(
+        """
+        INSERT INTO messages(
+          event_message_id, chat_id, chat_name, sender_open_id, sender_name, is_from_bot,
+          message_type, text_content, image_key, root_id, parent_id, created_at_ts
+        ) VALUES (:event_message_id, :chat_id, :chat_name, :sender_open_id, :sender_name, 0,
+        :message_type, :text_content, :image_key, :root_id, :parent_id, :created_at_ts)
+        """,
+        {
+            "event_message_id": event_message_id,
+            "chat_id": chat_id,
+            "chat_name": chat_name,
+            "sender_open_id": sender_open_id,
+            "sender_name": sender_name,
+            "message_type": message_type,
+            "text_content": text_content,
+            "image_key": image_key,
+            "root_id": root_id,
+            "parent_id": parent_id,
+            "created_at_ts": created_at_ts,
+        },
+    )
 
 
 def save_bot_text(chat_id: str, text: str, root_id: str | None, parent_id: str | None):
-    with _db_lock:
-        DB.execute(
-            """
-            INSERT INTO messages(
-              event_message_id, chat_id, chat_name, sender_open_id, sender_name, is_from_bot,
-              message_type, text_content, image_key, root_id, parent_id, created_at_ts
-            ) VALUES(NULL, ?, '', '', 'Sticksy', 1, 'text', ?, '', ?, ?, ?)
-            """,
-            (chat_id, text, root_id or "", parent_id or "", now_ts()),
-        )
-        DB.commit()
+    db_execute(
+        """
+        INSERT INTO messages(
+          event_message_id, chat_id, chat_name, sender_open_id, sender_name, is_from_bot,
+          message_type, text_content, image_key, root_id, parent_id, created_at_ts
+        ) VALUES(NULL, :chat_id, '', '', 'Sticksy', 1, 'text', :text, '', :root_id, :parent_id, :created_at_ts)
+        """,
+        {
+            "chat_id": chat_id,
+            "text": text,
+            "root_id": root_id or "",
+            "parent_id": parent_id or "",
+            "created_at_ts": now_ts(),
+        },
+    )
 
 
 def is_reply_to_bot(parent_id: str | None, root_id: str | None) -> bool:
-    ids = [x for x in [parent_id, root_id] if x]
-    if not ids:
+    if not parent_id and not root_id:
         return False
-    placeholders = ",".join(["?"] * len(ids))
-    query = f"SELECT 1 FROM bot_messages WHERE message_id IN ({placeholders}) LIMIT 1"
-    with _db_lock:
-        row = DB.execute(query, tuple(ids)).fetchone()
+    row = db_query_one(
+        "SELECT 1 FROM bot_messages WHERE message_id = :parent_id OR message_id = :root_id LIMIT 1",
+        {"parent_id": parent_id or "", "root_id": root_id or ""},
+    )
     return row is not None
 
 
@@ -453,11 +537,10 @@ def parse_time_window(query: str, user_tz: str) -> TimeWindow:
 
 
 def get_user_timezone(sender_open_id: str) -> str:
-    with _db_lock:
-        row = DB.execute(
-            "SELECT tz_name, cached_at_ts FROM user_timezone_cache WHERE open_id = ?",
-            (sender_open_id,),
-        ).fetchone()
+    row = db_query_one(
+        "SELECT tz_name, cached_at_ts FROM user_timezone_cache WHERE open_id = :open_id",
+        {"open_id": sender_open_id},
+    )
     if row and now_ts() - int(row["cached_at_ts"]) < 86400:
         return row["tz_name"]
 
@@ -482,34 +565,39 @@ def get_user_timezone(sender_open_id: str) -> str:
     except Exception:
         tz_name = "UTC"
 
-    with _db_lock:
-        DB.execute(
-            "INSERT OR REPLACE INTO user_timezone_cache(open_id, tz_name, cached_at_ts) VALUES(?, ?, ?)",
-            (sender_open_id, tz_name, now_ts()),
+    if IS_POSTGRES:
+        db_execute(
+            """
+            INSERT INTO user_timezone_cache(open_id, tz_name, cached_at_ts)
+            VALUES(:open_id, :tz_name, :cached_at_ts)
+            ON CONFLICT (open_id) DO UPDATE
+            SET tz_name = EXCLUDED.tz_name, cached_at_ts = EXCLUDED.cached_at_ts
+            """,
+            {"open_id": sender_open_id, "tz_name": tz_name, "cached_at_ts": now_ts()},
         )
-        DB.commit()
+    else:
+        db_execute(
+            "INSERT OR REPLACE INTO user_timezone_cache(open_id, tz_name, cached_at_ts) VALUES(:open_id, :tz_name, :cached_at_ts)",
+            {"open_id": sender_open_id, "tz_name": tz_name, "cached_at_ts": now_ts()},
+        )
 
     return tz_name
 
 
-def load_messages_for_window(chat_id: str, start_ts: int, end_ts: int, root_id: str | None) -> list[sqlite3.Row]:
-    params = [chat_id, start_ts, end_ts]
+def load_messages_for_window(chat_id: str, start_ts: int, end_ts: int, root_id: str | None) -> list[dict]:
+    params = {"chat_id": chat_id, "start_ts": start_ts, "end_ts": end_ts, "max_rows": MAX_SUMMARY_MESSAGES}
     sql = (
         "SELECT sender_name, sender_open_id, message_type, text_content, image_key, created_at_ts, root_id "
-        "FROM messages WHERE chat_id = ? AND created_at_ts >= ? AND created_at_ts < ?"
+        "FROM messages WHERE chat_id = :chat_id AND created_at_ts >= :start_ts AND created_at_ts < :end_ts"
     )
     if root_id:
-        sql += " AND root_id = ?"
-        params.append(root_id)
-    sql += " ORDER BY created_at_ts ASC LIMIT ?"
-    params.append(MAX_SUMMARY_MESSAGES)
-
-    with _db_lock:
-        rows = DB.execute(sql, tuple(params)).fetchall()
-    return rows
+        sql += " AND root_id = :root_id"
+        params["root_id"] = root_id
+    sql += " ORDER BY created_at_ts ASC LIMIT :max_rows"
+    return db_query_all(sql, params)
 
 
-def create_summary(query: str, asker_name: str, language_hint: str, rows: list[sqlite3.Row], window_label: str) -> tuple[str, list[str]]:
+def create_summary(query: str, asker_name: str, language_hint: str, rows: list[dict], window_label: str) -> tuple[str, list[str]]:
     message_lines = []
     image_pool = []
     for row in rows:
@@ -688,11 +776,10 @@ def infer_language_hint(query: str) -> str:
 
 def generate_topics(chat_id: str) -> list[dict]:
     cutoff = now_ts() - TOPIC_WINDOW_HOURS * 3600
-    with _db_lock:
-        rows = DB.execute(
-            "SELECT sender_name, text_content FROM messages WHERE chat_id = ? AND message_type = 'text' AND is_from_bot = 0 AND created_at_ts >= ? ORDER BY created_at_ts DESC LIMIT 150",
-            (chat_id, cutoff),
-        ).fetchall()
+    rows = db_query_all(
+        "SELECT sender_name, text_content FROM messages WHERE chat_id = :chat_id AND message_type = 'text' AND is_from_bot = 0 AND created_at_ts >= :cutoff ORDER BY created_at_ts DESC LIMIT 150",
+        {"chat_id": chat_id, "cutoff": cutoff},
+    )
 
     if not rows:
         return []
@@ -707,12 +794,10 @@ def generate_topics(chat_id: str) -> list[dict]:
     if not lines:
         return []
 
-    cached = None
-    with _db_lock:
-        cached = DB.execute(
-            "SELECT topics_json, computed_at_ts FROM topic_cache WHERE chat_id = ?",
-            (chat_id,),
-        ).fetchone()
+    cached = db_query_one(
+        "SELECT topics_json, computed_at_ts FROM topic_cache WHERE chat_id = :chat_id",
+        {"chat_id": chat_id},
+    )
     if cached and now_ts() - int(cached["computed_at_ts"]) < 600:
         try:
             return json.loads(cached["topics_json"])
@@ -738,12 +823,21 @@ def generate_topics(chat_id: str) -> list[dict]:
             if topic:
                 normalized.append({"topic": topic, "importance": max(1, min(5, importance))})
 
-        with _db_lock:
-            DB.execute(
-                "INSERT OR REPLACE INTO topic_cache(chat_id, topics_json, computed_at_ts) VALUES(?, ?, ?)",
-                (chat_id, json.dumps(normalized, ensure_ascii=False), now_ts()),
+        if IS_POSTGRES:
+            db_execute(
+                """
+                INSERT INTO topic_cache(chat_id, topics_json, computed_at_ts)
+                VALUES(:chat_id, :topics_json, :computed_at_ts)
+                ON CONFLICT (chat_id) DO UPDATE
+                SET topics_json = EXCLUDED.topics_json, computed_at_ts = EXCLUDED.computed_at_ts
+                """,
+                {"chat_id": chat_id, "topics_json": json.dumps(normalized, ensure_ascii=False), "computed_at_ts": now_ts()},
             )
-            DB.commit()
+        else:
+            db_execute(
+                "INSERT OR REPLACE INTO topic_cache(chat_id, topics_json, computed_at_ts) VALUES(:chat_id, :topics_json, :computed_at_ts)",
+                {"chat_id": chat_id, "topics_json": json.dumps(normalized, ensure_ascii=False), "computed_at_ts": now_ts()},
+            )
         return normalized
     except Exception:
         return []
@@ -983,21 +1077,20 @@ def monitor_page():
 def monitor_groups():
     one_hour = now_ts() - 3600
     one_day = now_ts() - 24 * 3600
-    with _db_lock:
-        groups = DB.execute(
-            """
-            SELECT chat_id, MAX(chat_name) AS chat_name,
-                   SUM(CASE WHEN created_at_ts >= ? THEN 1 ELSE 0 END) AS msg_count_1h,
-                   SUM(CASE WHEN created_at_ts >= ? THEN 1 ELSE 0 END) AS msg_count_24h,
-                   COUNT(DISTINCT CASE WHEN created_at_ts >= ? THEN sender_open_id ELSE NULL END) AS active_users_24h
-            FROM messages
-            WHERE is_from_bot = 0
-            GROUP BY chat_id
-            ORDER BY msg_count_24h DESC
-            LIMIT 50
-            """,
-            (one_hour, one_day, one_day),
-        ).fetchall()
+    groups = db_query_all(
+        """
+        SELECT chat_id, MAX(chat_name) AS chat_name,
+               SUM(CASE WHEN created_at_ts >= :one_hour THEN 1 ELSE 0 END) AS msg_count_1h,
+               SUM(CASE WHEN created_at_ts >= :one_day THEN 1 ELSE 0 END) AS msg_count_24h,
+               COUNT(DISTINCT CASE WHEN created_at_ts >= :one_day THEN sender_open_id ELSE NULL END) AS active_users_24h
+        FROM messages
+        WHERE is_from_bot = 0
+        GROUP BY chat_id
+        ORDER BY msg_count_24h DESC
+        LIMIT 50
+        """,
+        {"one_hour": one_hour, "one_day": one_day},
+    )
 
     output = []
     for row in groups:
