@@ -752,43 +752,88 @@ def find_first_media_url(obj):
     return None
 
 
+def extract_media_url_from_tenor_like(data: dict) -> str | None:
+    results = data.get("results")
+    if not isinstance(results, list) or not results:
+        return None
+    first = results[0] or {}
+    media_formats = first.get("media_formats") or {}
+    preferred_order = ["gif", "tinygif", "nanogif", "mediumgif", "webp", "tinywebp"]
+    for key in preferred_order:
+        candidate = media_formats.get(key) or {}
+        url = candidate.get("url")
+        if isinstance(url, str) and url.startswith(("http://", "https://")):
+            return url
+    return find_first_media_url(first)
+
+
 def search_klipy_sticker(query: str) -> str | None:
     if not KLIPY_API_KEY:
         return None
 
+    # Strategy 1: Tenor-compatible search endpoint used by KLIPY migration docs.
+    try:
+        resp = requests.get(
+            "https://api.klipy.com/v2/search",
+            params={"q": query, "key": KLIPY_API_KEY, "limit": 1, "media_filter": "gif"},
+            timeout=HTTP_TIMEOUT,
+        )
+        if resp.status_code < 400:
+            data = resp.json()
+            url = extract_media_url_from_tenor_like(data)
+            if url:
+                app.logger.info("Klipy sticker found via /v2/search")
+                return url
+        else:
+            app.logger.warning("Klipy /v2/search failed status=%s body=%s", resp.status_code, resp.text[:200])
+    except Exception:
+        app.logger.exception("Klipy /v2/search request error")
+
+    # Strategy 2: caller-provided URL (POST JSON).
     headers = {
         "Authorization": f"Bearer {KLIPY_API_KEY}",
         "X-API-Key": KLIPY_API_KEY,
+        "X-KLIPY-API-KEY": KLIPY_API_KEY,
         "Content-Type": "application/json",
     }
-    payload = {"query": query, "limit": 1}
-
+    payload = {"query": query, "q": query, "limit": 1}
     try:
         resp = requests.post(KLIPY_SEARCH_URL, headers=headers, json=payload, timeout=HTTP_TIMEOUT)
-        if resp.status_code >= 400:
-            return None
-        data = resp.json()
-        return find_first_media_url(data)
+        if resp.status_code < 400:
+            data = resp.json()
+            url = extract_media_url_from_tenor_like(data) or find_first_media_url(data)
+            if url:
+                app.logger.info("Klipy sticker found via configured URL")
+                return url
+        else:
+            app.logger.warning("Klipy configured URL failed status=%s body=%s", resp.status_code, resp.text[:200])
     except Exception:
-        return None
+        app.logger.exception("Klipy configured URL request error")
+
+    return None
 
 
 def send_sticker_reply(reply_to_message_id: str, chat_id: str, query: str):
     sticker_url = search_klipy_sticker(query)
     if not sticker_url:
+        app.logger.info("No sticker result for query=%s", query)
         return
 
     try:
         media = requests.get(sticker_url, timeout=HTTP_TIMEOUT)
         if media.status_code >= 400:
+            app.logger.warning("Sticker media download failed status=%s url=%s", media.status_code, sticker_url)
             return
         image_key = upload_lark_image(media.content)
         if not image_key:
+            app.logger.warning("Lark image upload failed for sticker_url=%s", sticker_url)
             return
         msg_id = send_lark_image_reply(reply_to_message_id, image_key)
         remember_bot_message(msg_id, chat_id)
         save_bot_text(chat_id, f"[sticker] {query}", None, reply_to_message_id)
+        app.logger.info("Sticker reply sent for query=%s", query)
     except Exception:
+        app.logger.exception("Sticker reply pipeline failed")
         return
 
 
