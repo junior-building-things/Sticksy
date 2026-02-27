@@ -455,6 +455,8 @@ def is_reply_to_bot(parent_id: str | None, root_id: str | None) -> bool:
 def sanitize_text(s: str) -> str:
     text = (s or "").strip()
     text = re.sub(r"@_user_\d+", "", text)
+    text = re.sub(r"<at\\b[^>]*>.*?</at>", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"@Sticksy\\b", "", text, flags=re.IGNORECASE)
     text = re.sub(r"\s+", " ", text).strip()
     return text
 
@@ -466,7 +468,15 @@ def mention_open_id(mention: dict) -> str:
 def is_bot_mention(mention: dict) -> bool:
     open_id = mention_open_id(mention)
     if LARK_BOT_OPEN_ID:
-        return open_id == LARK_BOT_OPEN_ID
+        if open_id == LARK_BOT_OPEN_ID:
+            return True
+        name = str(mention.get("name") or "").strip().lower()
+        if name == "sticksy":
+            return True
+        key = str(mention.get("key") or "").strip().lower()
+        if "sticksy" in key:
+            return True
+        return False
     # Fallback when bot open_id is not configured: treat any mention as bot mention.
     return True
 
@@ -793,6 +803,9 @@ def should_respond(message: dict, content_obj: dict) -> tuple[bool, list[str]]:
 
     if segments:
         return True, segments
+    if mentions and re.search(r"\\bsticksy\\b", raw_text, re.IGNORECASE):
+        fallback = sanitize_text(raw_text)
+        return (True, [fallback] if fallback else [])
     if replied:
         fallback = sanitize_text(raw_text)
         return (True, [fallback] if fallback else [])
