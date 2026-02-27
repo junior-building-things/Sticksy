@@ -61,6 +61,8 @@ Rules:
 - Output JSON only.
 - Focus on important topics. If many topics exist, keep lower-priority topics very short.
 - Attribute claims to specific speaker names when possible.
+- Always produce a summary, even when content is sparse.
+- Synthesize and compress; do not copy chat lines verbatim.
 
 JSON schema:
 {
@@ -72,7 +74,9 @@ JSON schema:
 }
 
 Constraints:
+- intro should be a brief synthesized overview (not a quote).
 - topics should be ordered by importance.
+- each topic summary must be a synthesized takeaway, not a transcript line.
 - include up to 3 image keys from the provided image pool if they are relevant.
 """.strip()
 
@@ -847,16 +851,20 @@ def create_summary(query: str, asker_name: str, language_hint: str, rows: list[d
 
     if not bullets:
         # Forced summary fallback: always synthesize concise bullets from available lines.
-        fallback_lines = []
-        for line in message_lines[-6:]:
-            fallback_lines.append(line)
-        if fallback_lines:
+        text_count = sum(1 for r in rows if (r.get("message_type") == "text" and (r.get("text_content") or "").strip()))
+        image_count = sum(1 for r in rows if (r.get("message_type") == "image" and (r.get("image_key") or "").strip()))
+        unique_speakers = {
+            ((r.get("sender_name") or "").strip() or "participant")
+            for r in rows
+            if (r.get("sender_name") or "").strip()
+        }
+        if rows:
             bullets = [
-                "- Conversation activity: Participants exchanged short updates and reactions.",
-                f"- Recent points: {' | '.join(fallback_lines[:3])}",
+                f"- Conversation activity: {len(unique_speakers) or 1} participants exchanged {text_count} text messages and {image_count} images.",
+                "- Main takeaway: The chat included short interactions and lightweight back-and-forth updates.",
             ]
-            if len(fallback_lines) > 3:
-                bullets.append(f"- Additional context: {' | '.join(fallback_lines[3:6])}")
+            if image_count > 0:
+                bullets.append("- Visual context: Shared images contributed additional context to the discussion.")
         else:
             bullets = ["- Conversation activity: Short exchanges occurred in this time window."]
 
