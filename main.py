@@ -538,6 +538,37 @@ def sanitize_text(s: str) -> str:
     return text
 
 
+def extract_text_from_rich_content(obj) -> str:
+    parts: list[str] = []
+
+    def walk(x):
+        if isinstance(x, dict):
+            tag = str(x.get("tag") or "").lower()
+            if tag == "text" and isinstance(x.get("text"), str):
+                parts.append(x.get("text"))
+            elif tag == "at":
+                name = x.get("user_name") or x.get("name") or ""
+                if isinstance(name, str) and name.strip():
+                    parts.append(name.strip())
+            for v in x.values():
+                walk(v)
+        elif isinstance(x, list):
+            for item in x:
+                walk(item)
+
+    walk(obj)
+    return sanitize_text(" ".join(parts))
+
+
+def extract_text_content(message_type: str, content_obj: dict) -> str:
+    mt = (message_type or "").lower()
+    if mt == "text":
+        return sanitize_text(content_obj.get("text") or "")
+    if mt in {"post", "interactive"}:
+        return extract_text_from_rich_content(content_obj)
+    return ""
+
+
 def mention_open_id(mention: dict) -> str:
     return ((mention.get("id") or {}).get("open_id")) or ""
 
@@ -1145,7 +1176,7 @@ def webhook():
         sender_name = profile.get("display_name") or "Unknown"
     chat_name = event.get("chat_name") or ""
     msg_type = message.get("message_type") or ""
-    text_content = sanitize_text(content_obj.get("text") or "") if msg_type == "text" else ""
+    text_content = extract_text_content(msg_type, content_obj)
     image_key = (content_obj.get("image_key") or "") if msg_type == "image" else ""
 
     create_time = int(message.get("create_time") or int(time.time() * 1000))
@@ -1163,15 +1194,16 @@ def webhook():
         parent_id,
     )
 
-    # Persist every incoming text/image for future summarization.
-    if msg_type in {"text", "image"}:
+    # Persist every incoming text-like/image message for future summarization.
+    persist_type = "image" if msg_type == "image" else "text"
+    if image_key or text_content:
         save_incoming_message(
             event_message_id=message_id,
             chat_id=chat_id,
             chat_name=chat_name,
             sender_open_id=sender_open_id,
             sender_name=sender_name,
-            message_type=msg_type,
+            message_type=persist_type,
             text_content=text_content,
             image_key=image_key,
             root_id=root_id,
