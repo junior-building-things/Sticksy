@@ -61,7 +61,6 @@ Rules:
 - Output JSON only.
 - Focus on important topics. If many topics exist, keep lower-priority topics very short.
 - Attribute claims to specific speaker names when possible.
-- Never mention that data is missing unless instructed.
 
 JSON schema:
 {
@@ -73,7 +72,6 @@ JSON schema:
 }
 
 Constraints:
-- intro should be one short line.
 - topics should be ordered by importance.
 - include up to 3 image keys from the provided image pool if they are relevant.
 """.strip()
