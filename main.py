@@ -185,6 +185,13 @@ def init_db():
               cached_at_ts BIGINT NOT NULL
             )
             """,
+            """
+            CREATE TABLE IF NOT EXISTS chat_profile_cache (
+              chat_id TEXT PRIMARY KEY,
+              chat_name TEXT NOT NULL,
+              cached_at_ts BIGINT NOT NULL
+            )
+            """,
         ]
     else:
         schema_sql = [
@@ -242,6 +249,13 @@ def init_db():
               cached_at_ts INTEGER NOT NULL
             )
             """,
+            """
+            CREATE TABLE IF NOT EXISTS chat_profile_cache (
+              chat_id TEXT PRIMARY KEY,
+              chat_name TEXT NOT NULL,
+              cached_at_ts INTEGER NOT NULL
+            )
+            """,
         ]
 
     for stmt in schema_sql:
@@ -270,6 +284,7 @@ def maybe_sweep_retention():
     db_execute("DELETE FROM topic_cache WHERE computed_at_ts < :cutoff", {"cutoff": cutoff})
     db_execute("DELETE FROM user_timezone_cache WHERE cached_at_ts < :cutoff", {"cutoff": cutoff})
     db_execute("DELETE FROM user_profile_cache WHERE cached_at_ts < :cutoff", {"cutoff": cutoff})
+    db_execute("DELETE FROM chat_profile_cache WHERE cached_at_ts < :cutoff", {"cutoff": cutoff})
     _last_retention_sweep = current
 
 
@@ -1161,6 +1176,110 @@ def generate_topics(chat_id: str) -> list[dict]:
         return []
 
 
+def resolve_chat_name(chat_id: str, fallback_name: str = "") -> str:
+    if fallback_name and fallback_name.strip():
+        return fallback_name.strip()
+
+    row = db_query_one(
+        "SELECT chat_name, cached_at_ts FROM chat_profile_cache WHERE chat_id = :chat_id",
+        {"chat_id": chat_id},
+    )
+    if row and now_ts() - int(row["cached_at_ts"] or 0) < 7 * 86400 and (row.get("chat_name") or "").strip():
+        return row["chat_name"].strip()
+
+    chat_name = ""
+    try:
+        resp = requests.get(
+            f"https://open.larkoffice.com/open-apis/im/v1/chats/{chat_id}",
+            headers=lark_headers(),
+            timeout=HTTP_TIMEOUT,
+        )
+        if resp.status_code < 400:
+            body = resp.json()
+            data = body.get("data") or {}
+            item = data.get("item") or data.get("chat") or data
+            chat_name = (item.get("name") or item.get("chat_name") or "").strip()
+    except Exception:
+        app.logger.exception("Failed to resolve chat name for chat_id=%s", chat_id)
+
+    if chat_name:
+        if IS_POSTGRES:
+            db_execute(
+                """
+                INSERT INTO chat_profile_cache(chat_id, chat_name, cached_at_ts)
+                VALUES(:chat_id, :chat_name, :cached_at_ts)
+                ON CONFLICT (chat_id) DO UPDATE
+                SET chat_name = EXCLUDED.chat_name, cached_at_ts = EXCLUDED.cached_at_ts
+                """,
+                {"chat_id": chat_id, "chat_name": chat_name, "cached_at_ts": now_ts()},
+            )
+        else:
+            db_execute(
+                "INSERT OR REPLACE INTO chat_profile_cache(chat_id, chat_name, cached_at_ts) VALUES(:chat_id, :chat_name, :cached_at_ts)",
+                {"chat_id": chat_id, "chat_name": chat_name, "cached_at_ts": now_ts()},
+            )
+        return chat_name
+
+    return chat_id
+
+
+def recent_monitor_messages(chat_id: str, limit: int = 60) -> list[dict]:
+    rows = db_query_all(
+        """
+        SELECT sender_name, text_content, created_at_ts
+        FROM messages
+        WHERE chat_id = :chat_id
+          AND is_from_bot = 0
+          AND message_type = 'text'
+          AND text_content IS NOT NULL
+          AND text_content <> ''
+        ORDER BY created_at_ts DESC
+        LIMIT :limit_rows
+        """,
+        {"chat_id": chat_id, "limit_rows": limit},
+    )
+    out = []
+    for row in reversed(rows):
+        out.append(
+            {
+                "sender_name": (row.get("sender_name") or "Unknown").strip() or "Unknown",
+                "text": (row.get("text_content") or "").strip(),
+                "ts": int(row.get("created_at_ts") or 0),
+            }
+        )
+    return out
+
+
+def build_topic_details(topics: list[dict], messages: list[dict]) -> list[dict]:
+    if not topics:
+        return []
+
+    details = []
+    for topic_obj in topics:
+        topic = (topic_obj.get("topic") or "").strip()
+        if not topic:
+            continue
+        terms = [t for t in re.findall(r"[\w\u4e00-\u9fff]+", topic.lower()) if len(t) > 1]
+        matched = []
+        for msg in messages:
+            text_l = (msg.get("text") or "").lower()
+            if terms and not any(t in text_l for t in terms):
+                continue
+            matched.append(msg)
+            if len(matched) >= 8:
+                break
+        if not matched:
+            matched = messages[-5:]
+        details.append(
+            {
+                "topic": topic,
+                "importance": int(topic_obj.get("importance") or 3),
+                "messages": matched,
+            }
+        )
+    return details
+
+
 # -------- Web Routes --------
 
 
@@ -1331,17 +1450,18 @@ def monitor_page():
   <title>Sticksy Monitor</title>
   <style>
     :root {
-      --bg: #f5f3ef;
-      --card: #ffffff;
-      --ink: #1e2a2f;
-      --muted: #5d6a70;
-      --accent: #0c7a6f;
-      --edge: #d9d3c8;
+      --bg: #090b10;
+      --bg2: #0f131b;
+      --card: #121826;
+      --ink: #f1f5ff;
+      --muted: #9ba6c0;
+      --accent: #36d6b0;
+      --edge: #242d40;
     }
     body {
       margin: 0;
       font-family: "IBM Plex Sans", "Segoe UI", sans-serif;
-      background: radial-gradient(circle at 8% 8%, #fff3cd 0, var(--bg) 40%);
+      background: radial-gradient(circle at 10% 0%, #1b2740 0, var(--bg) 45%);
       color: var(--ink);
     }
     .wrap { max-width: 1060px; margin: 0 auto; padding: 24px; }
@@ -1357,7 +1477,7 @@ def monitor_page():
       border: 1px solid var(--edge);
       border-radius: 14px;
       padding: 14px;
-      box-shadow: 0 6px 18px rgba(40,40,40,0.06);
+      box-shadow: 0 10px 22px rgba(0,0,0,0.28);
     }
     .chat { font-size: 15px; font-weight: 700; margin-bottom: 4px; }
     .meta { font-size: 12px; color: var(--muted); margin-bottom: 10px; }
@@ -1367,9 +1487,35 @@ def monitor_page():
       display: inline-block;
       padding: 3px 8px;
       border-radius: 999px;
-      background: #e6f5f2;
+      background: #18373a;
       color: var(--accent);
       font-size: 11px;
+      margin-right: 6px;
+    }
+    details.topic {
+      margin-top: 8px;
+      border: 1px solid var(--edge);
+      border-radius: 10px;
+      background: var(--bg2);
+      padding: 8px 10px;
+    }
+    details.topic summary {
+      cursor: pointer;
+      color: #d8e2ff;
+      font-weight: 600;
+      list-style: none;
+    }
+    details.topic summary::-webkit-details-marker { display: none; }
+    .msg {
+      margin-top: 8px;
+      font-size: 12px;
+      color: #d1dbef;
+      border-left: 2px solid #2f3b55;
+      padding-left: 8px;
+    }
+    .sender {
+      color: var(--accent);
+      font-weight: 600;
       margin-right: 6px;
     }
   </style>
@@ -1392,17 +1538,27 @@ def monitor_page():
         const card = document.createElement('div');
         card.className = 'card';
 
-        const topicItems = (g.topics || []).map(t => `<li>${t.topic}</li>`).join('') || '<li>No active topics</li>';
+        const topicItems = (g.topic_details || []).map(t => {
+          const messages = (t.messages || []).map(m => {
+            return `<div class="msg"><span class="sender">${m.sender_name}</span>${m.text}</div>`;
+          }).join('');
+          return `
+            <details class="topic">
+              <summary>${t.topic}</summary>
+              ${messages || '<div class="msg">No recent matching messages.</div>'}
+            </details>
+          `;
+        }).join('') || '<div class="msg">No active topics</div>';
 
         card.innerHTML = `
-          <div class="chat">${g.chat_name || g.chat_id}</div>
-          <div class="meta">Chat ID: ${g.chat_id}</div>
+          <div class="chat">${g.chat_name}</div>
+          <div class="meta">${g.chat_id}</div>
           <div>
             <span class="pill">1h msgs: ${g.msg_count_1h}</span>
             <span class="pill">24h msgs: ${g.msg_count_24h}</span>
             <span class="pill">Users: ${g.active_users_24h}</span>
           </div>
-          <ul>${topicItems}</ul>
+          <div>${topicItems}</div>
         `;
         grid.appendChild(card);
       }
@@ -1440,14 +1596,18 @@ def monitor_groups():
     for row in groups:
         chat_id = row["chat_id"]
         topics = generate_topics(chat_id)
+        recent_messages = recent_monitor_messages(chat_id, limit=60)
+        topic_details = build_topic_details(topics, recent_messages)
+        resolved_name = resolve_chat_name(chat_id, fallback_name=(row.get("chat_name") or ""))
         output.append(
             {
                 "chat_id": chat_id,
-                "chat_name": row["chat_name"],
+                "chat_name": resolved_name,
                 "msg_count_1h": int(row["msg_count_1h"] or 0),
                 "msg_count_24h": int(row["msg_count_24h"] or 0),
                 "active_users_24h": int(row["active_users_24h"] or 0),
                 "topics": topics,
+                "topic_details": topic_details,
             }
         )
 
