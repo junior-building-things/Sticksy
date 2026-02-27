@@ -174,6 +174,14 @@ def init_db():
               cached_at_ts BIGINT NOT NULL
             )
             """,
+            """
+            CREATE TABLE IF NOT EXISTS user_profile_cache (
+              open_id TEXT PRIMARY KEY,
+              tz_name TEXT NOT NULL,
+              display_name TEXT NOT NULL,
+              cached_at_ts BIGINT NOT NULL
+            )
+            """,
         ]
     else:
         schema_sql = [
@@ -223,6 +231,14 @@ def init_db():
               cached_at_ts INTEGER NOT NULL
             )
             """,
+            """
+            CREATE TABLE IF NOT EXISTS user_profile_cache (
+              open_id TEXT PRIMARY KEY,
+              tz_name TEXT NOT NULL,
+              display_name TEXT NOT NULL,
+              cached_at_ts INTEGER NOT NULL
+            )
+            """,
         ]
 
     for stmt in schema_sql:
@@ -250,6 +266,7 @@ def maybe_sweep_retention():
     db_execute("DELETE FROM processed_events WHERE created_at_ts < :cutoff", {"cutoff": cutoff})
     db_execute("DELETE FROM topic_cache WHERE computed_at_ts < :cutoff", {"cutoff": cutoff})
     db_execute("DELETE FROM user_timezone_cache WHERE cached_at_ts < :cutoff", {"cutoff": cutoff})
+    db_execute("DELETE FROM user_profile_cache WHERE cached_at_ts < :cutoff", {"cutoff": cutoff})
     _last_retention_sweep = current
 
 
@@ -590,15 +607,19 @@ def parse_time_window(query: str, user_tz: str) -> TimeWindow:
     return TimeWindow(int(start.timestamp()), int(end.timestamp()), "today")
 
 
-def get_user_timezone(sender_open_id: str) -> str:
+def get_user_profile(sender_open_id: str) -> dict:
+    if not sender_open_id:
+        return {"tz_name": "UTC", "display_name": ""}
+
     row = db_query_one(
-        "SELECT tz_name, cached_at_ts FROM user_timezone_cache WHERE open_id = :open_id",
+        "SELECT tz_name, display_name, cached_at_ts FROM user_profile_cache WHERE open_id = :open_id",
         {"open_id": sender_open_id},
     )
     if row and now_ts() - int(row["cached_at_ts"]) < 86400:
-        return row["tz_name"]
+        return {"tz_name": row["tz_name"] or "UTC", "display_name": row["display_name"] or ""}
 
     tz_name = "UTC"
+    display_name = ""
     try:
         resp = requests.get(
             f"https://open.larkoffice.com/open-apis/contact/v3/users/{sender_open_id}",
@@ -608,11 +629,13 @@ def get_user_timezone(sender_open_id: str) -> str:
         )
         if resp.status_code < 400:
             body = resp.json()
-            tz = (((body.get("data") or {}).get("user") or {}).get("timezone"))
+            user = ((body.get("data") or {}).get("user") or {})
+            tz = user.get("timezone")
             if tz:
                 tz_name = tz
+            display_name = (user.get("name") or user.get("en_name") or "").strip()
     except Exception:
-        tz_name = "UTC"
+        app.logger.exception("Failed to fetch user profile for open_id=%s", sender_open_id)
 
     try:
         _ = ZoneInfo(tz_name)
@@ -622,20 +645,35 @@ def get_user_timezone(sender_open_id: str) -> str:
     if IS_POSTGRES:
         db_execute(
             """
-            INSERT INTO user_timezone_cache(open_id, tz_name, cached_at_ts)
-            VALUES(:open_id, :tz_name, :cached_at_ts)
+            INSERT INTO user_profile_cache(open_id, tz_name, display_name, cached_at_ts)
+            VALUES(:open_id, :tz_name, :display_name, :cached_at_ts)
             ON CONFLICT (open_id) DO UPDATE
-            SET tz_name = EXCLUDED.tz_name, cached_at_ts = EXCLUDED.cached_at_ts
+            SET tz_name = EXCLUDED.tz_name, display_name = EXCLUDED.display_name, cached_at_ts = EXCLUDED.cached_at_ts
             """,
-            {"open_id": sender_open_id, "tz_name": tz_name, "cached_at_ts": now_ts()},
+            {
+                "open_id": sender_open_id,
+                "tz_name": tz_name,
+                "display_name": display_name,
+                "cached_at_ts": now_ts(),
+            },
         )
     else:
         db_execute(
-            "INSERT OR REPLACE INTO user_timezone_cache(open_id, tz_name, cached_at_ts) VALUES(:open_id, :tz_name, :cached_at_ts)",
-            {"open_id": sender_open_id, "tz_name": tz_name, "cached_at_ts": now_ts()},
+            "INSERT OR REPLACE INTO user_profile_cache(open_id, tz_name, display_name, cached_at_ts) VALUES(:open_id, :tz_name, :display_name, :cached_at_ts)",
+            {
+                "open_id": sender_open_id,
+                "tz_name": tz_name,
+                "display_name": display_name,
+                "cached_at_ts": now_ts(),
+            },
         )
 
-    return tz_name
+    return {"tz_name": tz_name, "display_name": display_name}
+
+
+def get_user_timezone(sender_open_id: str) -> str:
+    profile = get_user_profile(sender_open_id)
+    return profile.get("tz_name") or "UTC"
 
 
 def load_messages_for_window(chat_id: str, start_ts: int, end_ts: int, root_id: str | None) -> list[dict]:
@@ -1056,7 +1094,10 @@ def webhook():
         content_obj = {}
 
     sender_open_id = ((sender.get("sender_id") or {}).get("open_id")) or ""
-    sender_name = sender.get("sender_name") or sender.get("name") or "Unknown"
+    sender_name = sender.get("sender_name") or sender.get("name") or ""
+    profile = get_user_profile(sender_open_id)
+    if not sender_name or sender_name.lower() == "unknown":
+        sender_name = profile.get("display_name") or "Unknown"
     chat_name = event.get("chat_name") or ""
     msg_type = message.get("message_type") or ""
     text_content = sanitize_text(content_obj.get("text") or "") if msg_type == "text" else ""
@@ -1103,7 +1144,7 @@ def webhook():
         app.logger.info("Triggered but no actionable segments for message_id=%s", message_id)
         return "", 200
 
-    user_tz = get_user_timezone(sender_open_id)
+    user_tz = profile.get("tz_name") or get_user_timezone(sender_open_id)
     app.logger.info("Trigger accepted: segments=%s user_tz=%s", len(segments), user_tz)
 
     for seg in segments:
