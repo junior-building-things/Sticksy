@@ -93,7 +93,7 @@ Rules:
 - Use the recent chat context to infer tone and intent before generating the query.
 - The query should serve as a fun and cheeky reply to the user's message. Add a playful twist where possible.
 - Preserve the user's language when possible.
-- Keep the query 1-4 words.
+- Keep most queries 1-2 words. Avoid more than 3 unless it's a specific term (e.g. kpop demon hunters).
 """.strip()
 
 
