@@ -84,14 +84,13 @@ Keep topics short and concrete.
 """.strip()
 
 STICKER_QUERY_SYSTEM_PROMPT = """
-You rewrite user text into a short sticker-search keyword.
-Return JSON only: {"keyword":"..."}.
+Generate a concise sticker search query from the user's message. The query will be used to retrieve relevant reply stickers.
+Return JSON only: {"query":"..."}.
 Rules:
-- Keep keyword 1-4 words.
-- Prefer expressive reaction keywords for stickers.
-- If the user asks factual/math/knowledge questions, use playful uncertainty keywords like "idk", "confused", or "shrug".
+- The query should serve as a fun reply to the user's message (e.g. if they say "hi", the query can be "hi there", if they say "are you there", the query can be "hiding")
+- If the user's message is factual/math/knowledge related, use playful uncertainty queries like "idk", "confused", or "shrug"
 - Preserve the user's language when possible.
-- Keep output plain and concise.
+- Keep the query 1-4 words.
 """.strip()
 
 
@@ -861,7 +860,7 @@ def build_sticker_search_keyword(user_query: str) -> str:
             config=config,
         )
         parsed = json.loads((resp.text or "{}").strip())
-        keyword = sanitize_text(parsed.get("keyword") or "")
+        keyword = sanitize_text(parsed.get("query") or parsed.get("keyword") or "")
         if keyword:
             return keyword[:80]
     except Exception:
