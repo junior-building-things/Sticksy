@@ -646,7 +646,7 @@ def extract_bot_segments(raw_text: str, mentions: list[dict]) -> list[str]:
 
 def looks_like_summary_request(text: str) -> bool:
     t = text.lower()
-    keywords = ["summarize", "summary", "sum up", "总结", "總結", "概括", "回顾", "回顧"]
+    keywords = ["summarize", "summary", "sum up", "recap", "recap it", "总结", "總結", "概括", "回顾", "回顧"]
     return any(k in t for k in keywords)
 
 
