@@ -1025,7 +1025,7 @@ def send_sticker_reply(reply_to_message_id: str, chat_id: str, query: str):
     return
 
 
-def should_respond(message: dict, content_obj: dict) -> tuple[bool, list[str]]:
+def should_respond(message: dict, content_obj: dict, normalized_text: str) -> tuple[bool, list[str]]:
     mentions = message.get("mentions") or content_obj.get("mentions") or []
     raw_text = content_obj.get("text") or ""
     segments = extract_bot_segments(raw_text, mentions)
@@ -1036,11 +1036,11 @@ def should_respond(message: dict, content_obj: dict) -> tuple[bool, list[str]]:
 
     if segments:
         return True, segments
-    if mentions and re.search(r"\\bsticksy\\b", raw_text, re.IGNORECASE):
-        fallback = sanitize_text(raw_text)
+    if mentions and re.search(r"\\bsticksy\\b", (raw_text or normalized_text or ""), re.IGNORECASE):
+        fallback = sanitize_text(normalized_text or raw_text)
         return (True, [fallback] if fallback else [])
     if replied:
-        fallback = sanitize_text(raw_text)
+        fallback = sanitize_text(normalized_text or raw_text)
         return (True, [fallback] if fallback else [])
     return False, []
 
@@ -1211,7 +1211,7 @@ def webhook():
             created_at_ts=created_at_ts,
         )
 
-    should, segments = should_respond(message, content_obj)
+    should, segments = should_respond(message, content_obj, text_content)
     if not should:
         app.logger.info("No trigger detected for message_id=%s", message_id)
         return "", 200
