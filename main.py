@@ -1450,8 +1450,8 @@ def monitor_page():
   <title>Sticksy Monitor</title>
   <style>
     :root {
-      --bg: #090b10;
-      --bg2: #0f131b;
+      --bg: #000000;
+      --bg2: #0b0b0b;
       --card: #121826;
       --ink: #f1f5ff;
       --muted: #9ba6c0;
@@ -1461,7 +1461,7 @@ def monitor_page():
     body {
       margin: 0;
       font-family: "IBM Plex Sans", "Segoe UI", sans-serif;
-      background: radial-gradient(circle at 10% 0%, #1b2740 0, var(--bg) 45%);
+      background: var(--bg);
       color: var(--ink);
     }
     .wrap { max-width: 1060px; margin: 0 auto; padding: 24px; }
