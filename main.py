@@ -90,6 +90,7 @@ STICKER_QUERY_SYSTEM_PROMPT = """
 Generate a concise sticker search query from the user's message. The query will be used to retrieve relevant reply stickers.
 Return JSON only: {"query":"..."}.
 Rules:
+- Use the recent chat context to infer tone and intent before generating the query.
 - The query should serve as a fun reply to the user's message (e.g. if they say "hi", the query can be "hi there", if they say "are you there", the query can be "hiding")
 - If the user's message is factual/math/knowledge related, use playful uncertainty queries like "idk", "confused", or "shrug"
 - Preserve the user's language when possible.
@@ -976,7 +977,33 @@ def search_klipy_stickers(query: str) -> list[str]:
     return candidates
 
 
-def build_sticker_search_keyword(user_query: str) -> str:
+def load_recent_context_for_sticker(chat_id: str, exclude_event_message_id: str | None, limit: int = 20) -> list[str]:
+    rows = db_query_all(
+        """
+        SELECT sender_name, is_from_bot, message_type, text_content, created_at_ts, event_message_id
+        FROM messages
+        WHERE chat_id = :chat_id
+          AND (event_message_id IS NULL OR event_message_id <> :exclude_event_message_id)
+          AND (text_content IS NOT NULL AND text_content <> '')
+        ORDER BY created_at_ts DESC
+        LIMIT :limit_rows
+        """,
+        {
+            "chat_id": chat_id,
+            "exclude_event_message_id": exclude_event_message_id or "",
+            "limit_rows": limit,
+        },
+    )
+    lines = []
+    for row in reversed(rows):
+        name = (row.get("sender_name") or "").strip() or ("Sticksy" if int(row.get("is_from_bot") or 0) == 1 else "Participant")
+        text = (row.get("text_content") or "").strip()
+        if text:
+            lines.append(f"{name}: {text}")
+    return lines
+
+
+def build_sticker_search_keyword(user_query: str, context_lines: list[str]) -> str:
     raw = sanitize_text(user_query)
     if not raw:
         return ""
@@ -987,7 +1014,13 @@ def build_sticker_search_keyword(user_query: str) -> str:
         )
         resp = client.models.generate_content(
             model=GEMINI_MODEL,
-            contents=json.dumps({"user_query": raw}, ensure_ascii=False),
+            contents=json.dumps(
+                {
+                    "user_query": raw,
+                    "recent_context": context_lines[-20:],
+                },
+                ensure_ascii=False,
+            ),
             config=config,
         )
         parsed = json.loads((resp.text or "{}").strip())
@@ -999,8 +1032,9 @@ def build_sticker_search_keyword(user_query: str) -> str:
     return raw[:80]
 
 
-def send_sticker_reply(reply_to_message_id: str, chat_id: str, query: str):
-    sticker_query = build_sticker_search_keyword(query)
+def send_sticker_reply(reply_to_message_id: str, chat_id: str, query: str, current_message_id: str | None = None):
+    context_lines = load_recent_context_for_sticker(chat_id, current_message_id, limit=20)
+    sticker_query = build_sticker_search_keyword(query, context_lines)
     if not sticker_query:
         app.logger.info("No sticker keyword for query=%s", query)
         return
@@ -1281,7 +1315,7 @@ def webhook():
                 continue
         else:
             # Non-summary mention must reply with sticker only; on failure, stay silent.
-            send_sticker_reply(message_id, chat_id, seg)
+            send_sticker_reply(message_id, chat_id, seg, current_message_id=message_id)
             app.logger.info("Processed sticker flow for segment")
 
     return "", 200
