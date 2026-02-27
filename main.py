@@ -482,7 +482,51 @@ def is_reply_to_bot(parent_id: str | None, root_id: str | None) -> bool:
         "SELECT 1 FROM bot_messages WHERE message_id = :parent_id OR message_id = :root_id LIMIT 1",
         {"parent_id": parent_id or "", "root_id": root_id or ""},
     )
-    return row is not None
+    if row is not None:
+        return True
+
+    # Fallback: check Lark message metadata directly in case local cache missed a bot message id.
+    for message_id in [parent_id, root_id]:
+        if message_id and lark_message_is_from_bot(message_id):
+            return True
+    return False
+
+
+def lark_message_is_from_bot(message_id: str) -> bool:
+    try:
+        resp = requests.get(
+            f"https://open.larkoffice.com/open-apis/im/v1/messages/{message_id}",
+            headers=lark_headers(),
+            timeout=HTTP_TIMEOUT,
+        )
+        if resp.status_code >= 400:
+            app.logger.warning("Failed to fetch message metadata id=%s status=%s", message_id, resp.status_code)
+            return False
+        body = resp.json()
+        data = body.get("data") or {}
+        candidates = []
+        if isinstance(data.get("items"), list):
+            candidates.extend(data.get("items"))
+        if isinstance(data.get("message"), dict):
+            candidates.append(data.get("message"))
+        if isinstance(data, dict):
+            candidates.append(data)
+
+        for c in candidates:
+            sender_type = str(c.get("sender_type") or ((c.get("sender") or {}).get("sender_type") or "")).lower()
+            sender_open_id = (
+                ((c.get("sender_id") or {}).get("open_id"))
+                or (((c.get("sender") or {}).get("sender_id") or {}).get("open_id"))
+                or (((c.get("sender") or {}).get("id") or {}).get("open_id"))
+                or ""
+            )
+            if sender_type in {"bot", "app"}:
+                return True
+            if LARK_BOT_OPEN_ID and sender_open_id == LARK_BOT_OPEN_ID:
+                return True
+    except Exception:
+        app.logger.exception("Failed checking whether message is from bot id=%s", message_id)
+    return False
 
 
 def sanitize_text(s: str) -> str:
