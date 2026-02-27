@@ -897,6 +897,7 @@ def webhook():
 
     valid, reason = verify_lark_request(raw_body, payload)
     if not valid:
+        app.logger.warning("Webhook rejected: %s", reason)
         return Response(f"Unauthorized: {reason}", status=401)
 
     if "challenge" in payload:
@@ -905,17 +906,20 @@ def webhook():
     header = payload.get("header", {})
     event_type = header.get("event_type")
     if event_type and event_type != "im.message.receive_v1":
+        app.logger.info("Ignoring event_type=%s", event_type)
         return "", 200
 
     event = payload.get("event", {})
     sender = event.get("sender") or {}
     if sender.get("sender_type") != "user":
+        app.logger.info("Ignoring non-user sender_type=%s", sender.get("sender_type"))
         return "", 200
 
     message = event.get("message") or {}
     message_id = message.get("message_id")
     chat_id = message.get("chat_id")
     if not message_id or not chat_id:
+        app.logger.warning("Missing message_id/chat_id in payload")
         return "", 200
 
     dedupe = (
@@ -923,6 +927,7 @@ def webhook():
         or (f"evt:{header.get('event_id')}" if header.get("event_id") else None)
     )
     if dedupe and not record_event_once(dedupe):
+        app.logger.info("Duplicate event ignored: %s", dedupe)
         return "", 200
 
     content_obj = {}
@@ -943,6 +948,15 @@ def webhook():
 
     root_id = message.get("root_id") or message_id
     parent_id = message.get("parent_id") or ""
+    app.logger.info(
+        "Incoming message: chat_id=%s message_id=%s type=%s sender=%s root_id=%s parent_id=%s",
+        chat_id,
+        message_id,
+        msg_type,
+        sender_name,
+        root_id,
+        parent_id,
+    )
 
     # Persist every incoming text/image for future summarization.
     if msg_type in {"text", "image"}:
@@ -962,13 +976,16 @@ def webhook():
 
     should, segments = should_respond(message, content_obj)
     if not should:
+        app.logger.info("No trigger detected for message_id=%s", message_id)
         return "", 200
 
     # If reply-triggered but no text, nothing actionable.
     if not segments:
+        app.logger.info("Triggered but no actionable segments for message_id=%s", message_id)
         return "", 200
 
     user_tz = get_user_timezone(sender_open_id)
+    app.logger.info("Trigger accepted: segments=%s user_tz=%s", len(segments), user_tz)
 
     for seg in segments:
         if not seg:
@@ -980,7 +997,9 @@ def webhook():
             if not rows:
                 try:
                     send_missing_history_message(message_id, chat_id)
+                    app.logger.info("No history found for summary window; sent fallback message")
                 except Exception:
+                    app.logger.exception("Failed to send missing-history fallback")
                     pass
                 continue
 
@@ -1007,13 +1026,16 @@ def webhook():
                         image_msg_id = send_lark_image_reply(message_id, key)
                         remember_bot_message(image_msg_id, chat_id)
                     except Exception:
+                        app.logger.exception("Failed sending summary image reply")
                         continue
             except Exception:
                 # Outage/rate-limit behavior for summary: no message.
+                app.logger.exception("Summary generation/send failed; intentionally silent to user")
                 continue
         else:
             # Non-summary mention must reply with sticker only; on failure, stay silent.
             send_sticker_reply(message_id, chat_id, seg)
+            app.logger.info("Processed sticker flow for segment")
 
     return "", 200
 
@@ -1155,6 +1177,13 @@ def monitor_groups():
 @app.route("/healthz", methods=["GET"])
 def healthz():
     return jsonify({"ok": True, "model": GEMINI_MODEL, "retention_days": RETENTION_DAYS})
+
+
+@app.route("/debug/echo", methods=["GET", "POST"])
+def debug_echo():
+    body = request.get_json(silent=True)
+    app.logger.info("debug_echo called method=%s body=%s", request.method, body)
+    return jsonify({"ok": True, "method": request.method, "body": body})
 
 
 if __name__ == "__main__":
