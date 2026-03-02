@@ -104,7 +104,7 @@ Return JSON only with this schema:
 {
   "summary_bullets": ["string"],
   "next_steps": [
-    {"owner_name":"string","task":"string"}
+    {"owner_name":"string","owner_email":"string","task":"string"}
   ]
 }
 
@@ -112,6 +112,7 @@ Rules:
 - Preserve the language of the user's request.
 - Use the meeting transcript or meeting media as the source of truth.
 - Prefer owner names that exactly match the provided known participant names when applicable.
+- If the transcript includes a speaker email, include it in owner_email.
 - Always synthesize; do not copy long transcript lines verbatim.
 - summary_bullets should be concise key takeaways with no labels.
 - next_steps should capture owner-specific action items when the owner is clear.
@@ -1262,6 +1263,45 @@ def known_people_for_chat(chat_id: str, limit: int = 200) -> list[str]:
     return names[:200]
 
 
+def lookup_open_id_by_email(email: str) -> str:
+    target = (email or "").strip().lower()
+    if not target or "@" not in target:
+        return ""
+
+    try:
+        resp = requests.post(
+            "https://open.larkoffice.com/open-apis/contact/v3/users/batch_get_id?user_id_type=open_id",
+            headers=lark_headers(),
+            json={"emails": [target]},
+            timeout=HTTP_TIMEOUT,
+        )
+        if resp.status_code >= 400:
+            app.logger.warning("Email lookup failed status=%s email=%s body=%s", resp.status_code, target, resp.text[:300])
+            return ""
+        body = resp.json()
+        if body.get("code", 0) != 0:
+            app.logger.warning(
+                "Email lookup api error code=%s msg=%s email=%s",
+                body.get("code"),
+                body.get("msg"),
+                target,
+            )
+            return ""
+        data = body.get("data") or {}
+        user_list = data.get("user_list") or []
+        for item in user_list:
+            if ((item.get("email") or "").strip().lower() == target) and (item.get("open_id") or "").strip():
+                return item.get("open_id").strip()
+        if user_list:
+            open_id = (user_list[0].get("open_id") or "").strip()
+            if open_id:
+                return open_id
+    except Exception:
+        app.logger.exception("Email lookup exception email=%s", target)
+
+    return ""
+
+
 def lookup_owner_open_id(chat_id: str, owner_name: str) -> str:
     target = (owner_name or "").strip()
     if not target:
@@ -1309,8 +1349,14 @@ def lookup_owner_open_id(chat_id: str, owner_name: str) -> str:
     return ""
 
 
-def render_owner_reference(chat_id: str, owner_name: str) -> str:
+def render_owner_reference(chat_id: str, owner_name: str, owner_email: str = "") -> str:
     clean_name = (owner_name or "").strip()
+    clean_email = (owner_email or "").strip()
+    if clean_email:
+        email_open_id = lookup_open_id_by_email(clean_email)
+        if email_open_id:
+            label = clean_name or clean_email
+            return f'<at user_id="{email_open_id}">{label}</at>'
     if not clean_name:
         return "Unassigned"
     open_id = lookup_owner_open_id(chat_id, clean_name)
@@ -1358,7 +1404,11 @@ def format_meeting_reply(chat_id: str, mode: str, parsed: dict, meeting_title: s
         task = (item.get("task") or "").strip()
         if not task:
             continue
-        owner_ref = render_owner_reference(chat_id, item.get("owner_name") or "")
+        owner_ref = render_owner_reference(
+            chat_id,
+            item.get("owner_name") or "",
+            item.get("owner_email") or "",
+        )
         next_step_lines.append(f"- {owner_ref}: {task}")
 
     header = "Next steps from the meeting:" if mode == "next_steps" else "Meeting summary:"
