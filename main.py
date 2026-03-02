@@ -112,6 +112,7 @@ Rules:
 - Preserve the language of the user's request.
 - Use the meeting transcript or meeting media as the source of truth.
 - Prefer owner names that exactly match the provided known participant names when applicable.
+- Never translate, localize, or romanize people's names. Preserve person names exactly as they appear in the transcript or known_people.
 - If the transcript includes a speaker email, include it in owner_email.
 - Always synthesize; do not copy long transcript lines verbatim.
 - summary_bullets should be concise key takeaways with no labels.
@@ -1565,6 +1566,13 @@ def known_people_for_chat(chat_id: str, limit: int = 200) -> list[str]:
             seen.add(key)
             names.append(name)
 
+    for member in fetch_chat_member_directory(chat_id):
+        name = (member.get("display_name") or "").strip()
+        key = normalize_person_name(name)
+        if name and key and key not in seen and key != "unknown":
+            seen.add(key)
+            names.append(name)
+
     return names[:200]
 
 
@@ -1655,6 +1663,11 @@ def lookup_owner_open_id(chat_id: str, owner_name: str) -> str:
         display_name = (row.get("display_name") or "").strip()
         if person_name_matches(display_name, target):
             return (row.get("open_id") or "").strip()
+
+    for member in fetch_chat_member_directory(chat_id):
+        display_name = (member.get("display_name") or "").strip()
+        if person_name_matches(display_name, target):
+            return (member.get("open_id") or "").strip()
 
     return ""
 
