@@ -1952,10 +1952,50 @@ def batch_lookup_open_ids_by_email(emails: list[str]) -> dict[str, str]:
 
 
 def enrich_speaker_directory(speaker_directory: list[dict], chat_id: str) -> list[dict]:
-    chat_members = fetch_chat_member_directory(chat_id)
-    app.logger.warning("Enrichment: chat_members=%s for chat_id=%s", len(chat_members), chat_id)
+    known_by_normalized_name: dict[str, dict] = {}
 
-    member_by_normalized_name: dict[str, dict] = {}
+    # Source 1: message history for this chat (most reliable — actual senders)
+    message_senders = db_query_all(
+        """
+        SELECT DISTINCT sender_open_id, sender_name
+        FROM messages
+        WHERE chat_id = :chat_id
+          AND sender_open_id IS NOT NULL AND sender_open_id <> ''
+          AND sender_name IS NOT NULL AND sender_name <> ''
+          AND is_from_bot = 0
+        ORDER BY created_at_ts DESC
+        LIMIT 300
+        """,
+        {"chat_id": chat_id},
+    )
+    for row in message_senders:
+        open_id = (row.get("sender_open_id") or "").strip()
+        name = (row.get("sender_name") or "").strip()
+        if open_id and name:
+            key = normalize_person_name(name)
+            if key and key not in known_by_normalized_name:
+                known_by_normalized_name[key] = {"open_id": open_id, "name": name}
+
+    # Source 2: cached user profiles (cross-chat — broadens reach)
+    cached_profiles = db_query_all(
+        """
+        SELECT open_id, display_name
+        FROM user_profile_cache
+        WHERE display_name IS NOT NULL AND display_name <> ''
+        ORDER BY cached_at_ts DESC
+        LIMIT 300
+        """,
+    )
+    for row in cached_profiles:
+        open_id = (row.get("open_id") or "").strip()
+        name = (row.get("display_name") or "").strip()
+        if open_id and name:
+            key = normalize_person_name(name)
+            if key and key not in known_by_normalized_name:
+                known_by_normalized_name[key] = {"open_id": open_id, "name": name}
+
+    # Source 3: chat member API (may be restricted — bot often only sees itself)
+    chat_members = fetch_chat_member_directory(chat_id)
     unnamed_resolved = 0
     for member in chat_members:
         member_open_id = (member.get("open_id") or "").strip()
@@ -1969,21 +2009,27 @@ def enrich_speaker_directory(speaker_directory: list[dict], chat_id: str) -> lis
         if not member_name:
             continue
         key = normalize_person_name(member_name)
-        if key:
-            member_by_normalized_name[key] = {"open_id": member_open_id, "name": member_name}
-    app.logger.warning("Enrichment: member_name_map=%s unnamed_resolved=%s", len(member_by_normalized_name), unnamed_resolved)
+        if key and key not in known_by_normalized_name:
+            known_by_normalized_name[key] = {"open_id": member_open_id, "name": member_name}
 
+    app.logger.warning(
+        "Enrichment: chat_id=%s msg_senders=%s cached_profiles=%s chat_members=%s total_known=%s",
+        chat_id, len(message_senders), len(cached_profiles), len(chat_members), len(known_by_normalized_name),
+    )
+
+    # Step 1: fill open_ids on existing speaker_directory entries via name match
     for entry in speaker_directory:
         if (entry.get("open_id") or "").strip():
             continue
         entry_name = (entry.get("name") or "").strip()
         if not entry_name:
             continue
-        for member_info in member_by_normalized_name.values():
-            if person_name_matches(entry_name, member_info["name"]):
-                entry["open_id"] = member_info["open_id"]
+        for person in known_by_normalized_name.values():
+            if person_name_matches(entry_name, person["name"]):
+                entry["open_id"] = person["open_id"]
                 break
 
+    # Step 2: batch resolve emails still missing open_ids
     emails_to_resolve = []
     for entry in speaker_directory:
         if (entry.get("open_id") or "").strip():
@@ -2001,18 +2047,19 @@ def enrich_speaker_directory(speaker_directory: list[dict], chat_id: str) -> lis
             if email in email_to_open_id:
                 entry["open_id"] = email_to_open_id[email]
 
+    # Step 3: add all known people to directory so Gemini owner names can match
     existing_names = {normalize_person_name(e.get("name") or "") for e in speaker_directory}
     existing_open_ids = {(e.get("open_id") or "").strip() for e in speaker_directory if (e.get("open_id") or "").strip()}
-    for member_info in member_by_normalized_name.values():
-        key = normalize_person_name(member_info["name"])
+    for person in known_by_normalized_name.values():
+        key = normalize_person_name(person["name"])
         if key in existing_names:
             continue
-        if member_info["open_id"] in existing_open_ids:
+        if person["open_id"] in existing_open_ids:
             continue
         speaker_directory.append({
-            "name": member_info["name"],
+            "name": person["name"],
             "email": "",
-            "open_id": member_info["open_id"],
+            "open_id": person["open_id"],
         })
 
     return speaker_directory
