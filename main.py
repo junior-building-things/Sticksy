@@ -1953,15 +1953,25 @@ def batch_lookup_open_ids_by_email(emails: list[str]) -> dict[str, str]:
 
 def enrich_speaker_directory(speaker_directory: list[dict], chat_id: str) -> list[dict]:
     chat_members = fetch_chat_member_directory(chat_id)
+    app.logger.info("Enrichment: chat_members=%s for chat_id=%s", len(chat_members), chat_id)
 
     member_by_normalized_name: dict[str, dict] = {}
+    unnamed_resolved = 0
     for member in chat_members:
         member_open_id = (member.get("open_id") or "").strip()
+        if not member_open_id:
+            continue
         member_name = (member.get("display_name") or "").strip()
-        if member_open_id and member_name:
-            key = normalize_person_name(member_name)
-            if key:
-                member_by_normalized_name[key] = {"open_id": member_open_id, "name": member_name}
+        if not member_name and unnamed_resolved < 40:
+            unnamed_resolved += 1
+            profile = get_user_profile(member_open_id)
+            member_name = (profile.get("display_name") or "").strip()
+        if not member_name:
+            continue
+        key = normalize_person_name(member_name)
+        if key:
+            member_by_normalized_name[key] = {"open_id": member_open_id, "name": member_name}
+    app.logger.info("Enrichment: member_name_map=%s unnamed_resolved=%s", len(member_by_normalized_name), unnamed_resolved)
 
     for entry in speaker_directory:
         if (entry.get("open_id") or "").strip():
