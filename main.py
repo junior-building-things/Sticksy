@@ -1642,9 +1642,9 @@ def fetch_lark_minute_media(minute_token: str) -> tuple[bytes, str] | tuple[None
     return (content, mime_type)
 
 
-def fetch_lark_minute_transcript(minute_token: str) -> str:
+def fetch_lark_minute_transcript(minute_token: str) -> tuple[str, dict | None]:
     if not minute_token:
-        return ""
+        return ("", None)
 
     resp = requests.get(
         f"https://open.larkoffice.com/open-apis/minutes/v1/minutes/{minute_token}/transcript",
@@ -1667,11 +1667,11 @@ def fetch_lark_minute_transcript(minute_token: str) -> str:
         transcript_resp = resp
     else:
         app.logger.warning("Minutes transcript denied/unavailable: token=%s status=%s body=%s", minute_token, resp.status_code, resp.text[:300])
-        return ""
+        return ("", None)
 
     if transcript_resp.status_code >= 400:
         app.logger.warning("Minutes transcript download failed: token=%s status=%s", minute_token, transcript_resp.status_code)
-        return ""
+        return ("", None)
 
     content_type = (transcript_resp.headers.get("Content-Type") or "").lower()
     if "application/json" not in content_type:
@@ -1679,13 +1679,13 @@ def fetch_lark_minute_transcript(minute_token: str) -> str:
         if len(text_payload) > MAX_MEETING_TRANSCRIPT_CHARS:
             text_payload = text_payload[:MAX_MEETING_TRANSCRIPT_CHARS]
         app.logger.info("Minutes transcript plain text length=%s token=%s", len(text_payload), minute_token)
-        return text_payload
+        return (text_payload, None)
 
     try:
         body = transcript_resp.json()
     except Exception:
         app.logger.exception("Minutes transcript JSON parse failed: token=%s", minute_token)
-        return ""
+        return ("", None)
 
     if body.get("code", 0) not in {0, None}:
         app.logger.warning(
@@ -1694,7 +1694,7 @@ def fetch_lark_minute_transcript(minute_token: str) -> str:
             body.get("code"),
             body.get("msg"),
         )
-        return ""
+        return ("", None)
 
     data = body.get("data") or {}
     speaker_directory = extract_speaker_directory_from_obj(data)
@@ -1713,7 +1713,7 @@ def fetch_lark_minute_transcript(minute_token: str) -> str:
         if speaker_prefix:
             direct_text = f"{speaker_prefix}\n{direct_text}".strip()
         app.logger.info("Minutes transcript direct text length=%s token=%s", len(direct_text), minute_token)
-        return direct_text[:MAX_MEETING_TRANSCRIPT_CHARS]
+        return (direct_text[:MAX_MEETING_TRANSCRIPT_CHARS], data)
 
     download_url = (
         data.get("download_url")
@@ -1731,7 +1731,7 @@ def fetch_lark_minute_transcript(minute_token: str) -> str:
                 if len(text_payload) > MAX_MEETING_TRANSCRIPT_CHARS:
                     text_payload = text_payload[:MAX_MEETING_TRANSCRIPT_CHARS]
                 app.logger.info("Minutes transcript export downloaded length=%s token=%s", len(text_payload), minute_token)
-                return text_payload
+                return (text_payload, data)
             app.logger.warning("Minutes transcript export download failed: token=%s status=%s", minute_token, download_resp.status_code)
         except Exception:
             app.logger.exception("Failed to download minute transcript export")
@@ -1743,7 +1743,36 @@ def fetch_lark_minute_transcript(minute_token: str) -> str:
         app.logger.info("Minutes transcript extracted from JSON length=%s token=%s", len(extracted), minute_token)
     else:
         app.logger.warning("Minutes transcript returned no usable text: token=%s payload=%s", minute_token, json.dumps(body)[:400])
-    return extracted[:MAX_MEETING_TRANSCRIPT_CHARS] if extracted else ""
+    return (extracted[:MAX_MEETING_TRANSCRIPT_CHARS] if extracted else "", data)
+
+
+def extract_open_ids_from_obj(obj) -> set[str]:
+    ids: set[str] = set()
+
+    def walk(node):
+        if isinstance(node, dict):
+            for key, value in node.items():
+                key_l = str(key).lower()
+                if key_l in {"id", "open_id", "user_id", "speaker_id", "member_id", "owner_id"}:
+                    if isinstance(value, str):
+                        val = value.strip()
+                        if val.startswith("ou_") and len(val) > 3:
+                            ids.add(val)
+                    elif isinstance(value, dict):
+                        for sub_val in value.values():
+                            if isinstance(sub_val, str):
+                                sv = sub_val.strip()
+                                if sv.startswith("ou_") and len(sv) > 3:
+                                    ids.add(sv)
+                for v in node.values():
+                    walk(v)
+            return
+        if isinstance(node, list):
+            for item in node:
+                walk(item)
+
+    walk(obj)
+    return ids
 
 
 def normalize_person_name(name: str) -> str:
@@ -2455,7 +2484,7 @@ def build_meeting_reply(chat_id: str, request_text: str, minute_url: str, mode: 
     except Exception:
         app.logger.exception("Minutes meta unavailable; continuing with transcript/media only")
 
-    transcript_text = fetch_lark_minute_transcript(minute_token)
+    transcript_text, transcript_data = fetch_lark_minute_transcript(minute_token)
     if not transcript_text and minute_meta:
         transcript_text = extract_transcript_text_from_obj(minute_meta)
     media_bytes = None
@@ -2467,36 +2496,65 @@ def build_meeting_reply(chat_id: str, request_text: str, minute_url: str, mode: 
     if not transcript_text and not media_bytes:
         raise RuntimeError("meeting transcript is not accessible yet")
 
-    known_people = known_people_for_chat(chat_id)
+    # --- Build speaker directory from meeting data sources ---
+    # Source 1: speaker emails from transcript text
     transcript_directory = extract_transcript_speaker_emails(transcript_text)
+    # Source 2: participant info from statistics API
     participant_directory = extract_participant_directory_from_obj(fetch_lark_minute_statistics(minute_token))
     if not participant_directory:
         participant_directory = fetch_public_minute_page_people(minute_url)
-    speaker_directory = merge_people_directories(participant_directory, transcript_directory)
-    app.logger.info(
-        "Meeting people directory: token=%s transcript=%s participants=%s merged=%s",
+    # Source 3: participant info from transcript JSON and minute metadata
+    meta_participants = extract_participant_directory_from_obj(minute_meta) if minute_meta else []
+    transcript_participants = extract_participant_directory_from_obj(transcript_data) if transcript_data else []
+
+    speaker_directory = merge_people_directories(
+        participant_directory, transcript_directory, meta_participants, transcript_participants,
+    )
+
+    # Source 4: extract raw open_ids from meeting JSON structures and resolve to profiles
+    meeting_open_ids: set[str] = set()
+    if transcript_data:
+        meeting_open_ids |= extract_open_ids_from_obj(transcript_data)
+    if minute_meta:
+        meeting_open_ids |= extract_open_ids_from_obj(minute_meta)
+    if LARK_BOT_OPEN_ID:
+        meeting_open_ids.discard(LARK_BOT_OPEN_ID)
+
+    existing_ids = {(e.get("open_id") or "").strip() for e in speaker_directory if (e.get("open_id") or "").strip()}
+    resolved_from_meeting = 0
+    for open_id in meeting_open_ids:
+        if open_id in existing_ids:
+            continue
+        profile = get_user_profile(open_id)
+        name = (profile.get("display_name") or "").strip()
+        if name:
+            speaker_directory.append({"name": name, "email": "", "open_id": open_id})
+            existing_ids.add(open_id)
+            resolved_from_meeting += 1
+
+    app.logger.warning(
+        "Meeting speaker directory: token=%s text_emails=%s stats_participants=%s meta=%s transcript_json=%s meeting_ids=%s resolved=%s total=%s",
         minute_token,
         len(transcript_directory),
         len(participant_directory),
+        len(meta_participants),
+        len(transcript_participants),
+        len(meeting_open_ids),
+        resolved_from_meeting,
         len(speaker_directory),
     )
-    if not speaker_directory:
-        app.logger.warning(
-            "Meeting people directory empty: token=%s transcript=%s participants=%s",
-            minute_token,
-            len(transcript_directory),
-            len(participant_directory),
-        )
-    pre_enrich_count = len(speaker_directory)
+
+    # Fallback: enrich with chat message history and cached profiles
     speaker_directory = enrich_speaker_directory(speaker_directory, chat_id)
     enriched_with_id = sum(1 for e in speaker_directory if (e.get("open_id") or "").strip())
     app.logger.warning(
-        "Speaker directory enriched: token=%s before=%s after=%s with_open_id=%s",
+        "Speaker directory final: token=%s total=%s with_open_id=%s",
         minute_token,
-        pre_enrich_count,
         len(speaker_directory),
         enriched_with_id,
     )
+
+    known_people = known_people_for_chat(chat_id)
     for item in speaker_directory:
         speaker_name = (item.get("name") or "").strip()
         if not speaker_name:
