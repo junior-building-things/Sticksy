@@ -444,10 +444,11 @@ def build_post_content_from_text(text: str) -> tuple[str, list[list[dict]]]:
 def send_lark_post_reply(
     reply_to_message_id: str,
     text: str,
+    title: str = "",
     mention_open_id: str | None = None,
     mention_name: str | None = None,
 ) -> str | None:
-    title, content = build_post_content_from_text(text)
+    _, content = build_post_content_from_text(text)
     if mention_open_id:
         mention_parts = [
             {"tag": "at", "user_id": mention_open_id, "user_name": mention_name or "there"},
@@ -460,7 +461,7 @@ def send_lark_post_reply(
     locale_key = "zh_cn" if looks_like_cjk(text) else "en_us"
     post_body = {
         locale_key: {
-            "title": title,
+            "title": sanitize_text(title),
             "content": content,
         }
     }
@@ -1923,7 +1924,7 @@ def format_meeting_reply(
     return "\n".join(lines)
 
 
-def build_meeting_reply(chat_id: str, request_text: str, minute_url: str, mode: str) -> str:
+def build_meeting_reply(chat_id: str, request_text: str, minute_url: str, mode: str) -> tuple[str, str]:
     minute_token = extract_minutes_token(minute_url)
     if not minute_token:
         raise RuntimeError("invalid meeting transcript link")
@@ -1986,13 +1987,14 @@ def build_meeting_reply(chat_id: str, request_text: str, minute_url: str, mode: 
         or ((minute_meta.get("minute") or {}).get("title") or "").strip()
         or ((minute_meta.get("item") or {}).get("title") or "").strip()
     )
-    return format_meeting_reply(
+    reply_text = format_meeting_reply(
         chat_id,
         mode,
         parsed,
         meeting_title=title,
         speaker_directory=speaker_directory,
     )
+    return reply_text, title
 
 
 def send_missing_history_message(reply_to_message_id: str, chat_id: str):
@@ -2531,10 +2533,11 @@ def webhook():
                 continue
 
             try:
-                meeting_reply = build_meeting_reply(chat_id, seg, meeting_url, meeting_mode)
+                meeting_reply, meeting_title = build_meeting_reply(chat_id, seg, meeting_url, meeting_mode)
                 msg_id = send_lark_post_reply(
                     message_id,
                     meeting_reply,
+                    title=meeting_title,
                     mention_open_id=sender_open_id,
                     mention_name=sender_name,
                 )
