@@ -1910,8 +1910,6 @@ def format_meeting_reply(
         next_step_lines.append(f"• {owner_ref}: {task}")
 
     header = "Next steps:" if mode == "next_steps" else "Meeting summary:"
-    if meeting_title and mode != "next_steps":
-        header = f'{header} {meeting_title}'
 
     lines = [header]
     if mode != "next_steps" and summary_bullets:
