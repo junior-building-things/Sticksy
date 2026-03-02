@@ -1041,6 +1041,49 @@ def fetch_lark_minute_meta(minute_token: str) -> dict:
     return (body.get("data") or {})
 
 
+def fetch_lark_minute_statistics(minute_token: str) -> dict:
+    if not minute_token:
+        return {}
+
+    urls = [
+        f"https://open.larkoffice.com/open-apis/minutes/v1/minutes/{minute_token}/statistics",
+        f"https://open.larkoffice.com/open-apis/minutes/v1/{minute_token}/statistics",
+    ]
+
+    for idx, url in enumerate(urls):
+        try:
+            resp = requests.get(
+                url,
+                headers=lark_auth_headers(),
+                timeout=HTTP_TIMEOUT,
+            )
+            if resp.status_code == 404 and idx == 0:
+                continue
+            if resp.status_code >= 400:
+                app.logger.warning(
+                    "Minutes statistics unavailable: token=%s status=%s body=%s",
+                    minute_token,
+                    resp.status_code,
+                    resp.text[:300],
+                )
+                return {}
+            body = resp.json()
+            if body.get("code", 0) != 0:
+                app.logger.warning(
+                    "Minutes statistics api error: token=%s code=%s msg=%s",
+                    minute_token,
+                    body.get("code"),
+                    body.get("msg"),
+                )
+                return {}
+            return body.get("data") or {}
+        except Exception:
+            app.logger.exception("Minutes statistics request failed: token=%s", minute_token)
+            return {}
+
+    return {}
+
+
 def extract_transcript_text_from_obj(obj) -> str:
     text_parts: list[str] = []
 
@@ -1109,6 +1152,91 @@ def extract_speaker_directory_from_obj(obj) -> list[dict]:
 
     walk(obj)
     return out
+
+
+def extract_participant_directory_from_obj(obj) -> list[dict]:
+    out: list[dict] = []
+    seen: set[tuple[str, str, str]] = set()
+
+    name_keys = {"speaker", "speaker_name", "name", "user_name", "display_name", "participant_name", "attendee_name"}
+    email_keys = {"email", "speaker_email", "user_email", "email_address"}
+
+    def maybe_add(node):
+        if not isinstance(node, dict):
+            return
+
+        participant_name = ""
+        participant_email = ""
+        participant_open_id = ""
+
+        for key, value in node.items():
+            key_l = str(key).lower()
+            if key_l in name_keys and isinstance(value, str) and value.strip() and not participant_name:
+                participant_name = sanitize_text(value.strip())
+            if key_l in email_keys and isinstance(value, str) and value.strip() and not participant_email:
+                participant_email = value.strip().lower()
+            if key_l == "open_id" and isinstance(value, str) and value.strip() and not participant_open_id:
+                participant_open_id = value.strip()
+            if key_l == "user_id" and isinstance(value, str) and value.strip() and not participant_open_id:
+                participant_open_id = value.strip()
+            if key_l == "member_id":
+                if isinstance(value, str) and value.strip() and not participant_open_id:
+                    participant_open_id = value.strip()
+                elif isinstance(value, dict) and not participant_open_id:
+                    participant_open_id = (
+                        (value.get("open_id") or "").strip()
+                        or (value.get("user_id") or "").strip()
+                    )
+
+        if not participant_name:
+            return
+        if not participant_email and not participant_open_id:
+            return
+
+        item_key = (normalize_person_name(participant_name), participant_email, participant_open_id)
+        if item_key[0] and item_key not in seen:
+            seen.add(item_key)
+            out.append(
+                {
+                    "name": participant_name,
+                    "email": participant_email,
+                    "open_id": participant_open_id,
+                }
+            )
+
+    def walk(node):
+        if isinstance(node, dict):
+            maybe_add(node)
+            for value in node.values():
+                walk(value)
+        elif isinstance(node, list):
+            for item in node:
+                walk(item)
+
+    walk(obj)
+    return out
+
+
+def merge_people_directories(*directories: list[dict] | None) -> list[dict]:
+    merged: list[dict] = []
+    seen: set[tuple[str, str, str]] = set()
+
+    for directory in directories:
+        for item in directory or []:
+            name = (item.get("name") or "").strip()
+            email = (item.get("email") or "").strip().lower()
+            open_id = (
+                (item.get("open_id") or "").strip()
+                or (item.get("user_id") or "").strip()
+                or (item.get("id") or "").strip()
+            )
+            key = (normalize_person_name(name), email, open_id)
+            if not key[0] or key in seen:
+                continue
+            seen.add(key)
+            merged.append({"name": name, "email": email, "open_id": open_id})
+
+    return merged
 
 
 def fetch_lark_minute_media(minute_token: str) -> tuple[bytes, str] | tuple[None, None]:
@@ -1577,6 +1705,53 @@ def infer_owner_email_from_directory(owner_name: str, speaker_directory: list[di
     return exact_match_email or fuzzy_match_email
 
 
+def infer_owner_open_id_from_directory(owner_name: str, owner_email: str, speaker_directory: list[dict] | None) -> str:
+    target_name = (owner_name or "").strip()
+    target_email = (owner_email or "").strip().lower()
+    if not speaker_directory:
+        return ""
+
+    if not target_email:
+        email_match = re.search(r"([A-Z0-9._%+\-]+@[A-Z0-9.\-]+\.[A-Z]{2,})", target_name, re.IGNORECASE)
+        if email_match:
+            target_email = email_match.group(1).strip().lower()
+
+    if target_email:
+        for item in speaker_directory:
+            item_email = (item.get("email") or "").strip().lower()
+            item_open_id = (
+                (item.get("open_id") or "").strip()
+                or (item.get("user_id") or "").strip()
+                or (item.get("id") or "").strip()
+            )
+            if item_email and item_email == target_email and item_open_id:
+                return item_open_id
+
+    normalized_target = normalize_person_name(target_name)
+    if not normalized_target:
+        return ""
+
+    exact_match_open_id = ""
+    fuzzy_match_open_id = ""
+    for item in speaker_directory:
+        item_name = (item.get("name") or "").strip()
+        item_open_id = (
+            (item.get("open_id") or "").strip()
+            or (item.get("user_id") or "").strip()
+            or (item.get("id") or "").strip()
+        )
+        if not item_name or not item_open_id:
+            continue
+        normalized_item = normalize_person_name(item_name)
+        if normalized_item == normalized_target:
+            exact_match_open_id = item_open_id
+            break
+        if not fuzzy_match_open_id and person_name_matches(item_name, target_name):
+            fuzzy_match_open_id = item_open_id
+
+    return exact_match_open_id or fuzzy_match_open_id
+
+
 def render_owner_reference(chat_id: str, owner_name: str, owner_email: str = "", speaker_directory: list[dict] | None = None) -> str:
     raw_name = (owner_name or "").strip()
     clean_name = raw_name
@@ -1586,6 +1761,10 @@ def render_owner_reference(chat_id: str, owner_name: str, owner_email: str = "",
         if email_match:
             clean_email = email_match.group(1)
             clean_name = sanitize_text(raw_name.replace(clean_email, "").strip("()<> -")) or clean_name
+    direct_open_id = infer_owner_open_id_from_directory(clean_name or raw_name, clean_email, speaker_directory)
+    if direct_open_id:
+        label = clean_name or raw_name or clean_email or "there"
+        return f'<at user_id="{direct_open_id}">{label}</at>'
     if not clean_email:
         clean_email = infer_owner_email_from_directory(clean_name or raw_name, speaker_directory)
     if clean_email:
@@ -1694,7 +1873,16 @@ def build_meeting_reply(chat_id: str, request_text: str, minute_url: str, mode: 
         raise RuntimeError("meeting transcript is not accessible yet")
 
     known_people = known_people_for_chat(chat_id)
-    speaker_directory = extract_transcript_speaker_emails(transcript_text)
+    transcript_directory = extract_transcript_speaker_emails(transcript_text)
+    participant_directory = extract_participant_directory_from_obj(fetch_lark_minute_statistics(minute_token))
+    speaker_directory = merge_people_directories(participant_directory, transcript_directory)
+    app.logger.info(
+        "Meeting people directory: token=%s transcript=%s participants=%s merged=%s",
+        minute_token,
+        len(transcript_directory),
+        len(participant_directory),
+        len(speaker_directory),
+    )
     for item in speaker_directory:
         speaker_name = (item.get("name") or "").strip()
         if not speaker_name:
