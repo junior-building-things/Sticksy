@@ -3,6 +3,7 @@ import os
 import re
 import threading
 import time
+import html
 import hashlib
 import hmac
 from dataclasses import dataclass
@@ -1389,6 +1390,115 @@ def merge_people_directories(*directories: list[dict] | None) -> list[dict]:
     return merged
 
 
+def extract_people_directory_from_text_blob(blob: str) -> list[dict]:
+    out: list[dict] = []
+    seen: set[tuple[str, str, str]] = set()
+    if not blob:
+        return out
+
+    variants = []
+    for candidate in [
+        blob,
+        html.unescape(blob),
+        blob.replace('\\"', '"').replace("\\/", "/"),
+    ]:
+        normalized = (candidate or "").strip()
+        if normalized and normalized not in variants:
+            variants.append(normalized)
+
+    name_key = r'(?:name|display_name|user_name|participant_name|attendee_name|speaker_name)'
+    email_key = r'(?:email|user_email|speaker_email|email_address)'
+    id_key = r'(?:open_id|user_id|member_id|id)'
+
+    patterns = [
+        re.compile(
+            rf'"{name_key}"\s*:\s*"([^"]{{1,120}})".{{0,400}}?"{email_key}"\s*:\s*"([^"]+@[^"]+)"(?:.{{0,200}}?"{id_key}"\s*:\s*"([^"]+)")?',
+            re.IGNORECASE | re.DOTALL,
+        ),
+        re.compile(
+            rf'"{email_key}"\s*:\s*"([^"]+@[^"]+)".{{0,400}}?"{name_key}"\s*:\s*"([^"]{{1,120}})"(?:.{{0,200}}?"{id_key}"\s*:\s*"([^"]+)")?',
+            re.IGNORECASE | re.DOTALL,
+        ),
+        re.compile(
+            rf'"{name_key}"\s*:\s*"([^"]{{1,120}})".{{0,300}}?"{id_key}"\s*:\s*"([^"]+)"',
+            re.IGNORECASE | re.DOTALL,
+        ),
+        re.compile(
+            rf'"{id_key}"\s*:\s*"([^"]+)".{{0,300}}?"{name_key}"\s*:\s*"([^"]{{1,120}})"',
+            re.IGNORECASE | re.DOTALL,
+        ),
+    ]
+
+    for text_blob in variants:
+        for match in patterns[0].finditer(text_blob):
+            name = sanitize_text(match.group(1) or "")
+            email_value = (match.group(2) or "").strip().lower()
+            open_id = (match.group(3) or "").strip()
+            key = (normalize_person_name(name), email_value, open_id)
+            if key[0] and (email_value or open_id) and key not in seen:
+                seen.add(key)
+                out.append({"name": name, "email": email_value, "open_id": open_id})
+
+        for match in patterns[1].finditer(text_blob):
+            email_value = (match.group(1) or "").strip().lower()
+            name = sanitize_text(match.group(2) or "")
+            open_id = (match.group(3) or "").strip()
+            key = (normalize_person_name(name), email_value, open_id)
+            if key[0] and (email_value or open_id) and key not in seen:
+                seen.add(key)
+                out.append({"name": name, "email": email_value, "open_id": open_id})
+
+        for match in patterns[2].finditer(text_blob):
+            name = sanitize_text(match.group(1) or "")
+            open_id = (match.group(2) or "").strip()
+            key = (normalize_person_name(name), "", open_id)
+            if key[0] and open_id and key not in seen:
+                seen.add(key)
+                out.append({"name": name, "email": "", "open_id": open_id})
+
+        for match in patterns[3].finditer(text_blob):
+            open_id = (match.group(1) or "").strip()
+            name = sanitize_text(match.group(2) or "")
+            key = (normalize_person_name(name), "", open_id)
+            if key[0] and open_id and key not in seen:
+                seen.add(key)
+                out.append({"name": name, "email": "", "open_id": open_id})
+
+    return out
+
+
+def fetch_public_minute_page_people(minute_url: str) -> list[dict]:
+    if not minute_url:
+        return []
+
+    try:
+        resp = requests.get(
+            minute_url,
+            headers={"User-Agent": "SticksyBot/1.0"},
+            timeout=HTTP_TIMEOUT,
+        )
+        if resp.status_code >= 400:
+            app.logger.warning(
+                "Public minute page unavailable: url=%s status=%s body=%s",
+                minute_url,
+                resp.status_code,
+                resp.text[:300],
+            )
+            return []
+
+        page_text = decode_response_text(resp)
+        if not page_text:
+            app.logger.warning("Public minute page empty: url=%s", minute_url)
+            return []
+
+        people = extract_people_directory_from_text_blob(page_text)
+        app.logger.info("Public minute page people extracted: url=%s count=%s", minute_url, len(people))
+        return people
+    except Exception:
+        app.logger.exception("Failed fetching public minute page: url=%s", minute_url)
+        return []
+
+
 def fetch_lark_minute_media(minute_token: str) -> tuple[bytes, str] | tuple[None, None]:
     if not minute_token:
         return (None, None)
@@ -2130,6 +2240,8 @@ def build_meeting_reply(chat_id: str, request_text: str, minute_url: str, mode: 
     known_people = known_people_for_chat(chat_id)
     transcript_directory = extract_transcript_speaker_emails(transcript_text)
     participant_directory = extract_participant_directory_from_obj(fetch_lark_minute_statistics(minute_token))
+    if not participant_directory:
+        participant_directory = fetch_public_minute_page_people(minute_url)
     speaker_directory = merge_people_directories(participant_directory, transcript_directory)
     app.logger.info(
         "Meeting people directory: token=%s transcript=%s participants=%s merged=%s",
