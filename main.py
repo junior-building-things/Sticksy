@@ -46,6 +46,7 @@ TOPIC_WINDOW_HOURS = 6
 MAX_STICKER_UPLOAD_BYTES = int(os.environ.get("MAX_STICKER_UPLOAD_BYTES", "9500000"))
 MAX_MEETING_TRANSCRIPT_CHARS = int(os.environ.get("MAX_MEETING_TRANSCRIPT_CHARS", "120000"))
 MAX_MEETING_MEDIA_BYTES = int(os.environ.get("MAX_MEETING_MEDIA_BYTES", "18000000"))
+GLOBAL_LEARN_SCOPE = "__global__"
 
 client = genai.Client(api_key=GEMINI_API_KEY)
 
@@ -348,11 +349,11 @@ def parse_learning_instruction(text_value: str) -> str:
 
 def save_learned_term(chat_id: str, instruction_text: str, learned_by: str = ""):
     normalized_key = normalize_learning_key(instruction_text)
-    if not chat_id or not normalized_key:
+    if not normalized_key:
         return
 
     params = {
-        "chat_id": chat_id,
+        "chat_id": GLOBAL_LEARN_SCOPE,
         "normalized_key": normalized_key,
         "instruction_text": instruction_text.strip(),
         "learned_by": (learned_by or "").strip(),
@@ -381,8 +382,6 @@ def save_learned_term(chat_id: str, instruction_text: str, learned_by: str = "")
 
 
 def load_learned_terms(chat_id: str, limit: int = 40) -> list[str]:
-    if not chat_id:
-        return []
     rows = db_query_all(
         """
         SELECT instruction_text
@@ -391,7 +390,7 @@ def load_learned_terms(chat_id: str, limit: int = 40) -> list[str]:
         ORDER BY created_at_ts DESC
         LIMIT :limit_rows
         """,
-        {"chat_id": chat_id, "limit_rows": limit},
+        {"chat_id": GLOBAL_LEARN_SCOPE, "limit_rows": limit},
     )
     return [(row.get("instruction_text") or "").strip() for row in rows if (row.get("instruction_text") or "").strip()]
 
@@ -490,12 +489,16 @@ def build_post_content_from_text(text: str) -> tuple[str, list[list[dict]]]:
     lines = (text or "").splitlines()
     content: list[list[dict]] = []
     at_pattern = re.compile(r'<at user_id="([^"]+)">(.+?)</at>', re.IGNORECASE)
+    underlined_headers = {"Meeting summary:", "Next steps:"}
 
     for raw_line in lines:
         line = raw_line.rstrip()
         if not line.strip():
             if content:
                 content.append([{"tag": "text", "text": " "}])
+            continue
+        if line.strip() in underlined_headers:
+            content.append([{"tag": "text", "text": line.strip(), "style": ["underline"]}])
             continue
 
         paragraph: list[dict] = []
@@ -2741,8 +2744,6 @@ def webhook():
                     message_id,
                     meeting_reply,
                     title=meeting_title,
-                    mention_open_id=sender_open_id,
-                    mention_name=sender_name,
                 )
                 remember_bot_message(msg_id, chat_id)
                 save_bot_text(chat_id, meeting_reply, root_id, message_id, event_message_id=msg_id)
