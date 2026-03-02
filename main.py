@@ -1062,7 +1062,7 @@ def fetch_lark_minute_transcript(minute_token: str) -> str:
         return ""
 
     resp = requests.get(
-        f"https://open.larkoffice.com/open-apis/minutes/v1/{minute_token}/transcript",
+        f"https://open.larkoffice.com/open-apis/minutes/v1/minutes/{minute_token}/transcript",
         headers=lark_auth_headers(),
         timeout=HTTP_TIMEOUT,
         allow_redirects=False,
