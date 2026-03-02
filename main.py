@@ -411,6 +411,8 @@ def build_post_content_from_text(text: str) -> tuple[str, list[list[dict]]]:
     for raw_line in lines:
         line = raw_line.rstrip()
         if not line.strip():
+            if content:
+                content.append([{"tag": "text", "text": " "}])
             continue
 
         paragraph: list[dict] = []
@@ -1892,7 +1894,7 @@ def format_meeting_reply(
     for item in parsed.get("summary_bullets") or []:
         text_item = (item or "").strip()
         if text_item:
-            summary_bullets.append(f"- {text_item}")
+            summary_bullets.append(f"• {text_item}")
 
     next_step_lines = []
     for item in parsed.get("next_steps") or []:
@@ -1905,20 +1907,22 @@ def format_meeting_reply(
             item.get("owner_email") or "",
             speaker_directory=speaker_directory,
         )
-        next_step_lines.append(f"- {owner_ref}: {task}")
+        next_step_lines.append(f"• {owner_ref}: {task}")
 
     header = "Next steps:" if mode == "next_steps" else "Meeting summary:"
     if meeting_title and mode != "next_steps":
         header = f'{header} {meeting_title}'
 
-    sections = [header]
+    lines = [header]
     if mode != "next_steps" and summary_bullets:
-        sections.append("\n".join(summary_bullets))
+        lines.extend(summary_bullets)
     if next_step_lines:
         if mode != "next_steps":
-            sections.append("Next steps:")
-        sections.append("\n".join(next_step_lines))
-    return "\n".join(s for s in sections if s)
+            if summary_bullets:
+                lines.append("")
+            lines.append("Next steps:")
+        lines.extend(next_step_lines)
+    return "\n".join(lines)
 
 
 def build_meeting_reply(chat_id: str, request_text: str, minute_url: str, mode: str) -> str:
