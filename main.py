@@ -1344,7 +1344,77 @@ def lookup_owner_open_id(chat_id: str, owner_name: str) -> str:
     return ""
 
 
-def render_owner_reference(chat_id: str, owner_name: str, owner_email: str = "") -> str:
+def extract_transcript_speaker_emails(transcript_text: str) -> list[dict]:
+    out: list[dict] = []
+    seen: set[tuple[str, str]] = set()
+    if not transcript_text:
+        return out
+
+    patterns = [
+        re.compile(
+            r"([^\n:<>]{1,120}?)\s*<([A-Z0-9._%+\-]+@[A-Z0-9.\-]+\.[A-Z]{2,})>",
+            re.IGNORECASE,
+        ),
+        re.compile(
+            r"([^\n:()]{1,120}?)\s*\(([A-Z0-9._%+\-]+@[A-Z0-9.\-]+\.[A-Z]{2,})\)",
+            re.IGNORECASE,
+        ),
+        re.compile(
+            r"([^\n:]{1,120}?)\s+([A-Z0-9._%+\-]+@[A-Z0-9.\-]+\.[A-Z]{2,})\s*:",
+            re.IGNORECASE,
+        ),
+    ]
+
+    for line in (transcript_text or "").splitlines():
+        line_text = line.strip()
+        if not line_text:
+            continue
+        for pattern in patterns:
+            for match in pattern.finditer(line_text):
+                speaker_name = sanitize_text((match.group(1) or "").strip(" -|"))
+                speaker_email = (match.group(2) or "").strip().lower()
+                if not speaker_name or not speaker_email:
+                    continue
+                key = (normalize_person_name(speaker_name), speaker_email)
+                if not key[0] or key in seen:
+                    continue
+                seen.add(key)
+                out.append({"name": speaker_name, "email": speaker_email})
+
+    return out
+
+
+def infer_owner_email_from_directory(owner_name: str, speaker_directory: list[dict] | None) -> str:
+    target = (owner_name or "").strip()
+    if not target or not speaker_directory:
+        return ""
+
+    email_match = re.search(r"([A-Z0-9._%+\-]+@[A-Z0-9.\-]+\.[A-Z]{2,})", target, re.IGNORECASE)
+    if email_match:
+        return email_match.group(1).strip().lower()
+
+    normalized_target = normalize_person_name(target)
+    if not normalized_target:
+        return ""
+
+    exact_match_email = ""
+    fuzzy_match_email = ""
+    for item in speaker_directory:
+        speaker_name = (item.get("name") or "").strip()
+        speaker_email = (item.get("email") or "").strip().lower()
+        if not speaker_name or not speaker_email:
+            continue
+        normalized_speaker = normalize_person_name(speaker_name)
+        if normalized_speaker == normalized_target:
+            exact_match_email = speaker_email
+            break
+        if not fuzzy_match_email and person_name_matches(speaker_name, target):
+            fuzzy_match_email = speaker_email
+
+    return exact_match_email or fuzzy_match_email
+
+
+def render_owner_reference(chat_id: str, owner_name: str, owner_email: str = "", speaker_directory: list[dict] | None = None) -> str:
     raw_name = (owner_name or "").strip()
     clean_name = raw_name
     clean_email = (owner_email or "").strip()
@@ -1353,6 +1423,8 @@ def render_owner_reference(chat_id: str, owner_name: str, owner_email: str = "")
         if email_match:
             clean_email = email_match.group(1)
             clean_name = sanitize_text(raw_name.replace(clean_email, "").strip("()<> -")) or clean_name
+    if not clean_email:
+        clean_email = infer_owner_email_from_directory(clean_name or raw_name, speaker_directory)
     if clean_email:
         email_open_id = lookup_open_id_by_email(clean_email)
         if email_open_id:
@@ -1393,7 +1465,13 @@ def analyze_meeting_with_gemini(request_text: str, minute_url: str, minute_meta:
     return json.loads(raw)
 
 
-def format_meeting_reply(chat_id: str, mode: str, parsed: dict, meeting_title: str = "") -> str:
+def format_meeting_reply(
+    chat_id: str,
+    mode: str,
+    parsed: dict,
+    meeting_title: str = "",
+    speaker_directory: list[dict] | None = None,
+) -> str:
     summary_bullets = []
     for item in parsed.get("summary_bullets") or []:
         text_item = (item or "").strip()
@@ -1409,6 +1487,7 @@ def format_meeting_reply(chat_id: str, mode: str, parsed: dict, meeting_title: s
             chat_id,
             item.get("owner_name") or "",
             item.get("owner_email") or "",
+            speaker_directory=speaker_directory,
         )
         next_step_lines.append(f"- {owner_ref}: {task}")
 
@@ -1450,6 +1529,14 @@ def build_meeting_reply(chat_id: str, request_text: str, minute_url: str, mode: 
         raise RuntimeError("meeting transcript is not accessible yet")
 
     known_people = known_people_for_chat(chat_id)
+    speaker_directory = extract_transcript_speaker_emails(transcript_text)
+    for item in speaker_directory:
+        speaker_name = (item.get("name") or "").strip()
+        if not speaker_name:
+            continue
+        key = normalize_person_name(speaker_name)
+        if key and all(normalize_person_name(existing) != key for existing in known_people):
+            known_people.append(speaker_name)
     parsed = analyze_meeting_with_gemini(
         request_text=request_text,
         minute_url=minute_url,
@@ -1465,7 +1552,13 @@ def build_meeting_reply(chat_id: str, request_text: str, minute_url: str, mode: 
         or ((minute_meta.get("minute") or {}).get("title") or "").strip()
         or ((minute_meta.get("item") or {}).get("title") or "").strip()
     )
-    return format_meeting_reply(chat_id, mode, parsed, meeting_title=title)
+    return format_meeting_reply(
+        chat_id,
+        mode,
+        parsed,
+        meeting_title=title,
+        speaker_directory=speaker_directory,
+    )
 
 
 def send_missing_history_message(reply_to_message_id: str, chat_id: str):
