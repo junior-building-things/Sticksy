@@ -979,6 +979,7 @@ def extract_transcript_text_from_obj(obj) -> str:
                     if key_l in {
                         "text", "content", "paragraph_text", "sentence_text",
                         "transcript", "topic", "summary", "speaker", "speaker_name",
+                        "email", "speaker_email", "user_email", "email_address",
                     }:
                         text_parts.append(val)
                 else:
@@ -1365,8 +1366,8 @@ def extract_transcript_speaker_emails(transcript_text: str) -> list[dict]:
         ),
     ]
 
-    for line in (transcript_text or "").splitlines():
-        line_text = line.strip()
+    lines = [(line or "").strip() for line in (transcript_text or "").splitlines()]
+    for idx, line_text in enumerate(lines):
         if not line_text:
             continue
         for pattern in patterns:
@@ -1380,6 +1381,31 @@ def extract_transcript_speaker_emails(transcript_text: str) -> list[dict]:
                     continue
                 seen.add(key)
                 out.append({"name": speaker_name, "email": speaker_email})
+
+        standalone_email = re.fullmatch(
+            r"([A-Z0-9._%+\-]+@[A-Z0-9.\-]+\.[A-Z]{2,})",
+            line_text,
+            re.IGNORECASE,
+        )
+        if standalone_email:
+            speaker_email = standalone_email.group(1).strip().lower()
+            speaker_name = ""
+            for prev_idx in range(idx - 1, max(-1, idx - 4), -1):
+                candidate = lines[prev_idx].strip()
+                if not candidate:
+                    continue
+                if "@" in candidate:
+                    continue
+                if len(candidate) > 120:
+                    continue
+                speaker_name = sanitize_text(candidate.strip(" -|"))
+                if speaker_name:
+                    break
+            if speaker_name:
+                key = (normalize_person_name(speaker_name), speaker_email)
+                if key[0] and key not in seen:
+                    seen.add(key)
+                    out.append({"name": speaker_name, "email": speaker_email})
 
     return out
 
@@ -1430,11 +1456,13 @@ def render_owner_reference(chat_id: str, owner_name: str, owner_email: str = "",
         if email_open_id:
             label = clean_name or clean_email
             return f'<at user_id="{email_open_id}">{label}</at>'
+        app.logger.info("Owner email could not be resolved for tag: name=%s email=%s", clean_name or raw_name, clean_email)
     if not clean_name:
         return "Unassigned"
     open_id = lookup_owner_open_id(chat_id, clean_name)
     if open_id:
         return f'<at user_id="{open_id}">{clean_name}</at>'
+    app.logger.info("Owner name could not be resolved for tag: name=%s", clean_name)
     return clean_name
 
 
