@@ -1034,6 +1034,74 @@ def fetch_lark_minute_media(minute_token: str) -> tuple[bytes, str] | tuple[None
     return (content, mime_type)
 
 
+def fetch_lark_minute_transcript(minute_token: str) -> str:
+    if not minute_token:
+        return ""
+
+    resp = requests.get(
+        f"https://open.larkoffice.com/open-apis/minutes/v1/{minute_token}/transcript",
+        headers=lark_auth_headers(),
+        timeout=HTTP_TIMEOUT,
+        allow_redirects=False,
+    )
+
+    transcript_resp = None
+    if resp.status_code in {301, 302, 303, 307, 308} and resp.headers.get("Location"):
+        transcript_resp = requests.get(resp.headers["Location"], timeout=HTTP_TIMEOUT)
+    elif resp.status_code < 400:
+        transcript_resp = resp
+    else:
+        return ""
+
+    if transcript_resp.status_code >= 400:
+        return ""
+
+    content_type = (transcript_resp.headers.get("Content-Type") or "").lower()
+    if "application/json" not in content_type:
+        text_payload = transcript_resp.text.strip()
+        if len(text_payload) > MAX_MEETING_TRANSCRIPT_CHARS:
+            text_payload = text_payload[:MAX_MEETING_TRANSCRIPT_CHARS]
+        return text_payload
+
+    try:
+        body = transcript_resp.json()
+    except Exception:
+        return ""
+
+    if body.get("code", 0) not in {0, None}:
+        return ""
+
+    data = body.get("data") or {}
+
+    direct_text = (
+        (data.get("transcript") if isinstance(data.get("transcript"), str) else "")
+        or (data.get("content") if isinstance(data.get("content"), str) else "")
+        or (data.get("text") if isinstance(data.get("text"), str) else "")
+    ).strip()
+    if direct_text:
+        return direct_text[:MAX_MEETING_TRANSCRIPT_CHARS]
+
+    download_url = (
+        data.get("download_url")
+        or data.get("url")
+        or ((data.get("transcript") or {}).get("download_url") if isinstance(data.get("transcript"), dict) else "")
+        or ((data.get("transcript") or {}).get("url") if isinstance(data.get("transcript"), dict) else "")
+    )
+    if isinstance(download_url, str) and download_url:
+        try:
+            download_resp = requests.get(download_url, timeout=HTTP_TIMEOUT)
+            if download_resp.status_code < 400:
+                text_payload = download_resp.text.strip()
+                if len(text_payload) > MAX_MEETING_TRANSCRIPT_CHARS:
+                    text_payload = text_payload[:MAX_MEETING_TRANSCRIPT_CHARS]
+                return text_payload
+        except Exception:
+            app.logger.exception("Failed to download minute transcript export")
+
+    extracted = extract_transcript_text_from_obj(data)
+    return extracted[:MAX_MEETING_TRANSCRIPT_CHARS] if extracted else ""
+
+
 def lookup_owner_open_id(chat_id: str, owner_name: str) -> str:
     target = (owner_name or "").strip()
     if not target:
@@ -1156,7 +1224,9 @@ def build_meeting_reply(chat_id: str, request_text: str, minute_url: str, mode: 
         raise RuntimeError("invalid meeting transcript link")
 
     minute_meta = fetch_lark_minute_meta(minute_token)
-    transcript_text = extract_transcript_text_from_obj(minute_meta)
+    transcript_text = fetch_lark_minute_transcript(minute_token)
+    if not transcript_text:
+        transcript_text = extract_transcript_text_from_obj(minute_meta)
     media_bytes = None
     media_mime_type = None
 
