@@ -2005,7 +2005,10 @@ def format_meeting_reply(
             item.get("owner_email") or "",
             speaker_directory=speaker_directory,
         )
-        next_step_lines.append(f"{idx}. {owner_ref}: {task}")
+        if owner_ref == "Unassigned":
+            next_step_lines.append(f"{idx}. {task}")
+        else:
+            next_step_lines.append(f"{idx}. {owner_ref}: {task}")
 
     header = "Next steps:" if mode == "next_steps" else "Meeting summary:"
 
