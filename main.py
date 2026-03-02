@@ -111,6 +111,7 @@ Return JSON only with this schema:
 Rules:
 - Preserve the language of the user's request.
 - Use the meeting transcript or meeting media as the source of truth.
+- Prefer owner names that exactly match the provided known participant names when applicable.
 - Always synthesize; do not copy long transcript lines verbatim.
 - summary_bullets should be concise key takeaways with no labels.
 - next_steps should capture owner-specific action items when the owner is clear.
@@ -1149,11 +1150,122 @@ def fetch_lark_minute_transcript(minute_token: str) -> str:
     return extracted[:MAX_MEETING_TRANSCRIPT_CHARS] if extracted else ""
 
 
+def normalize_person_name(name: str) -> str:
+    cleaned = re.sub(r"[^0-9A-Za-z\u4e00-\u9fff]+", " ", (name or "").lower()).strip()
+    cleaned = re.sub(r"\s+", " ", cleaned)
+    return cleaned
+
+
+def person_name_matches(candidate: str, target: str) -> bool:
+    cand = normalize_person_name(candidate)
+    targ = normalize_person_name(target)
+    if not cand or not targ:
+        return False
+    if cand == targ:
+        return True
+    if cand in targ or targ in cand:
+        return True
+
+    cand_parts = set(cand.split())
+    targ_parts = set(targ.split())
+    if not cand_parts or not targ_parts:
+        return False
+    overlap = len(cand_parts & targ_parts)
+    if overlap >= min(len(cand_parts), len(targ_parts)):
+        return True
+    if overlap >= 2:
+        return True
+    return False
+
+
+def fetch_chat_member_directory(chat_id: str) -> list[dict]:
+    members: list[dict] = []
+    page_token = ""
+    seen = set()
+
+    for _ in range(5):
+        params = {"member_id_type": "open_id", "page_size": 100}
+        if page_token:
+            params["page_token"] = page_token
+        try:
+            resp = requests.get(
+                f"https://open.larkoffice.com/open-apis/im/v1/chats/{chat_id}/members",
+                headers=lark_headers(),
+                params=params,
+                timeout=HTTP_TIMEOUT,
+            )
+            if resp.status_code >= 400:
+                app.logger.warning("Chat member lookup failed chat_id=%s status=%s", chat_id, resp.status_code)
+                break
+            body = resp.json()
+            if body.get("code", 0) != 0:
+                app.logger.warning("Chat member lookup api error chat_id=%s code=%s msg=%s", chat_id, body.get("code"), body.get("msg"))
+                break
+            data = body.get("data") or {}
+            items = data.get("items") or []
+            for item in items:
+                member_open_id = (
+                    ((item.get("member_id") or {}).get("open_id"))
+                    or ((item.get("member_id") or {}).get("user_id"))
+                    or ((item.get("member_id") or {}).get("id"))
+                    or (item.get("open_id") or "")
+                )
+                member_name = (item.get("name") or item.get("display_name") or item.get("member_name") or "").strip()
+                key = (member_open_id, member_name)
+                if key in seen:
+                    continue
+                seen.add(key)
+                if member_open_id or member_name:
+                    members.append({"open_id": member_open_id, "display_name": member_name})
+            if not data.get("has_more"):
+                break
+            page_token = data.get("page_token") or ""
+            if not page_token:
+                break
+        except Exception:
+            app.logger.exception("Chat member lookup exception chat_id=%s", chat_id)
+            break
+
+    return members
+
+
+def known_people_for_chat(chat_id: str, limit: int = 200) -> list[str]:
+    names: list[str] = []
+    seen = set()
+
+    rows = db_query_all(
+        """
+        SELECT sender_name
+        FROM messages
+        WHERE chat_id = :chat_id
+          AND sender_name IS NOT NULL
+          AND sender_name <> ''
+        ORDER BY created_at_ts DESC
+        LIMIT :limit_rows
+        """,
+        {"chat_id": chat_id, "limit_rows": limit},
+    )
+    for row in rows:
+        name = (row.get("sender_name") or "").strip()
+        key = normalize_person_name(name)
+        if name and key and key not in seen and key != "unknown":
+            seen.add(key)
+            names.append(name)
+
+    for member in fetch_chat_member_directory(chat_id):
+        name = (member.get("display_name") or "").strip()
+        key = normalize_person_name(name)
+        if name and key and key not in seen and key != "unknown":
+            seen.add(key)
+            names.append(name)
+
+    return names[:200]
+
+
 def lookup_owner_open_id(chat_id: str, owner_name: str) -> str:
     target = (owner_name or "").strip()
     if not target:
         return ""
-    target_l = target.lower()
 
     rows = db_query_all(
         """
@@ -1171,12 +1283,13 @@ def lookup_owner_open_id(chat_id: str, owner_name: str) -> str:
     )
     for row in rows:
         sender_name = (row.get("sender_name") or "").strip()
-        if sender_name and sender_name.lower() == target_l:
+        if person_name_matches(sender_name, target):
             return (row.get("sender_open_id") or "").strip()
-    for row in rows:
-        sender_name = (row.get("sender_name") or "").strip()
-        if sender_name and (target_l in sender_name.lower() or sender_name.lower() in target_l):
-            return (row.get("sender_open_id") or "").strip()
+
+    for member in fetch_chat_member_directory(chat_id):
+        display_name = (member.get("display_name") or "").strip()
+        if person_name_matches(display_name, target):
+            return (member.get("open_id") or "").strip()
 
     cached = db_query_all(
         """
@@ -1190,11 +1303,7 @@ def lookup_owner_open_id(chat_id: str, owner_name: str) -> str:
     )
     for row in cached:
         display_name = (row.get("display_name") or "").strip()
-        if display_name and display_name.lower() == target_l:
-            return (row.get("open_id") or "").strip()
-    for row in cached:
-        display_name = (row.get("display_name") or "").strip()
-        if display_name and (target_l in display_name.lower() or display_name.lower() in target_l):
+        if person_name_matches(display_name, target):
             return (row.get("open_id") or "").strip()
 
     return ""
@@ -1210,12 +1319,13 @@ def render_owner_reference(chat_id: str, owner_name: str) -> str:
     return clean_name
 
 
-def analyze_meeting_with_gemini(request_text: str, minute_url: str, minute_meta: dict, transcript_text: str, media_bytes: bytes | None, media_mime_type: str | None) -> dict:
+def analyze_meeting_with_gemini(request_text: str, minute_url: str, minute_meta: dict, transcript_text: str, media_bytes: bytes | None, media_mime_type: str | None, known_people: list[str]) -> dict:
     user_payload = {
         "request": request_text,
         "minute_url": minute_url,
         "minute_meta": minute_meta,
         "transcript_excerpt": transcript_text,
+        "known_people": known_people,
     }
     parts = [
         types.Part.from_text(text=json.dumps(user_payload, ensure_ascii=False)),
@@ -1288,6 +1398,7 @@ def build_meeting_reply(chat_id: str, request_text: str, minute_url: str, mode: 
     if not transcript_text and not media_bytes:
         raise RuntimeError("meeting transcript is not accessible yet")
 
+    known_people = known_people_for_chat(chat_id)
     parsed = analyze_meeting_with_gemini(
         request_text=request_text,
         minute_url=minute_url,
@@ -1295,6 +1406,7 @@ def build_meeting_reply(chat_id: str, request_text: str, minute_url: str, mode: 
         transcript_text=transcript_text,
         media_bytes=media_bytes,
         media_mime_type=media_mime_type,
+        known_people=known_people,
     )
 
     title = (
