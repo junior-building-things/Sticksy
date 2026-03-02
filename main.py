@@ -1077,7 +1077,19 @@ def fetch_lark_minute_statistics(minute_token: str) -> dict:
                     body.get("msg"),
                 )
                 return {}
-            return body.get("data") or {}
+            data = body.get("data") or {}
+            try:
+                top_keys = sorted([str(k) for k in data.keys()]) if isinstance(data, dict) else []
+                sample = json.dumps(data, ensure_ascii=False)[:1200]
+                app.logger.info(
+                    "Minutes statistics payload: token=%s keys=%s sample=%s",
+                    minute_token,
+                    top_keys,
+                    sample,
+                )
+            except Exception:
+                app.logger.exception("Failed to summarize minutes statistics payload: token=%s", minute_token)
+            return data
         except Exception:
             app.logger.exception("Minutes statistics request failed: token=%s", minute_token)
             return {}
