@@ -1914,6 +1914,100 @@ def lookup_open_id_by_email(email: str) -> str:
     return ""
 
 
+def batch_lookup_open_ids_by_email(emails: list[str]) -> dict[str, str]:
+    result: dict[str, str] = {}
+    targets = list({(e or "").strip().lower() for e in emails if (e or "").strip() and "@" in (e or "")})
+    if not targets:
+        return result
+
+    for i in range(0, len(targets), 50):
+        batch = targets[i : i + 50]
+        try:
+            resp = requests.post(
+                "https://open.larkoffice.com/open-apis/contact/v3/users/batch_get_id?user_id_type=open_id",
+                headers=lark_headers(),
+                json={"emails": batch},
+                timeout=HTTP_TIMEOUT,
+            )
+            if resp.status_code >= 400:
+                app.logger.warning("Batch email lookup failed status=%s", resp.status_code)
+                continue
+            body = resp.json()
+            if body.get("code", 0) != 0:
+                app.logger.warning("Batch email lookup api error code=%s msg=%s", body.get("code"), body.get("msg"))
+                continue
+            user_list = (body.get("data") or {}).get("user_list") or []
+            for item in user_list:
+                email = (item.get("email") or "").strip().lower()
+                open_id = (
+                    (item.get("open_id") or "").strip()
+                    or (item.get("user_id") or "").strip()
+                )
+                if email and open_id:
+                    result[email] = open_id
+        except Exception:
+            app.logger.exception("Batch email lookup exception")
+
+    return result
+
+
+def enrich_speaker_directory(speaker_directory: list[dict], chat_id: str) -> list[dict]:
+    chat_members = fetch_chat_member_directory(chat_id)
+
+    member_by_normalized_name: dict[str, dict] = {}
+    for member in chat_members:
+        member_open_id = (member.get("open_id") or "").strip()
+        member_name = (member.get("display_name") or "").strip()
+        if member_open_id and member_name:
+            key = normalize_person_name(member_name)
+            if key:
+                member_by_normalized_name[key] = {"open_id": member_open_id, "name": member_name}
+
+    for entry in speaker_directory:
+        if (entry.get("open_id") or "").strip():
+            continue
+        entry_name = (entry.get("name") or "").strip()
+        if not entry_name:
+            continue
+        for member_info in member_by_normalized_name.values():
+            if person_name_matches(entry_name, member_info["name"]):
+                entry["open_id"] = member_info["open_id"]
+                break
+
+    emails_to_resolve = []
+    for entry in speaker_directory:
+        if (entry.get("open_id") or "").strip():
+            continue
+        email = (entry.get("email") or "").strip().lower()
+        if email and "@" in email:
+            emails_to_resolve.append(email)
+
+    if emails_to_resolve:
+        email_to_open_id = batch_lookup_open_ids_by_email(emails_to_resolve)
+        for entry in speaker_directory:
+            if (entry.get("open_id") or "").strip():
+                continue
+            email = (entry.get("email") or "").strip().lower()
+            if email in email_to_open_id:
+                entry["open_id"] = email_to_open_id[email]
+
+    existing_names = {normalize_person_name(e.get("name") or "") for e in speaker_directory}
+    existing_open_ids = {(e.get("open_id") or "").strip() for e in speaker_directory if (e.get("open_id") or "").strip()}
+    for member_info in member_by_normalized_name.values():
+        key = normalize_person_name(member_info["name"])
+        if key in existing_names:
+            continue
+        if member_info["open_id"] in existing_open_ids:
+            continue
+        speaker_directory.append({
+            "name": member_info["name"],
+            "email": "",
+            "open_id": member_info["open_id"],
+        })
+
+    return speaker_directory
+
+
 def lookup_owner_open_id(chat_id: str, owner_name: str) -> str:
     target = (owner_name or "").strip()
     if not target:
@@ -2336,6 +2430,16 @@ def build_meeting_reply(chat_id: str, request_text: str, minute_url: str, mode: 
             len(transcript_directory),
             len(participant_directory),
         )
+    pre_enrich_count = len(speaker_directory)
+    speaker_directory = enrich_speaker_directory(speaker_directory, chat_id)
+    enriched_with_id = sum(1 for e in speaker_directory if (e.get("open_id") or "").strip())
+    app.logger.info(
+        "Speaker directory enriched: token=%s before=%s after=%s with_open_id=%s",
+        minute_token,
+        pre_enrich_count,
+        len(speaker_directory),
+        enriched_with_id,
+    )
     for item in speaker_directory:
         speaker_name = (item.get("name") or "").strip()
         if not speaker_name:
