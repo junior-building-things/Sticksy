@@ -402,6 +402,84 @@ def send_lark_text_reply(reply_to_message_id: str, text: str, mention_open_id: s
     return ((data.get("data") or {}).get("message_id"))
 
 
+def build_post_content_from_text(text: str) -> tuple[str, list[list[dict]]]:
+    lines = (text or "").splitlines()
+    title = ""
+    content: list[list[dict]] = []
+    at_pattern = re.compile(r'<at user_id="([^"]+)">(.+?)</at>', re.IGNORECASE)
+
+    for raw_line in lines:
+        line = raw_line.rstrip()
+        if not title and line.strip():
+            title = sanitize_text(re.sub(r"<at\b[^>]*>.*?</at>", "", line, flags=re.IGNORECASE)) or "Sticksy"
+            continue
+        if not line.strip():
+            continue
+
+        paragraph: list[dict] = []
+        cursor = 0
+        for match in at_pattern.finditer(line):
+            prefix = line[cursor:match.start()]
+            if prefix:
+                paragraph.append({"tag": "text", "text": prefix})
+            paragraph.append(
+                {
+                    "tag": "at",
+                    "user_id": (match.group(1) or "").strip(),
+                    "user_name": (match.group(2) or "").strip() or "there",
+                }
+            )
+            cursor = match.end()
+        suffix = line[cursor:]
+        if suffix:
+            paragraph.append({"tag": "text", "text": suffix})
+        if not paragraph:
+            paragraph = [{"tag": "text", "text": line}]
+        content.append(paragraph)
+
+    if not title:
+        title = "Sticksy"
+    if not content:
+        content = [[{"tag": "text", "text": text or title}]]
+    return title, content
+
+
+def send_lark_post_reply(
+    reply_to_message_id: str,
+    text: str,
+    mention_open_id: str | None = None,
+    mention_name: str | None = None,
+) -> str | None:
+    title, content = build_post_content_from_text(text)
+    if mention_open_id:
+        content = [[
+            {"tag": "at", "user_id": mention_open_id, "user_name": mention_name or "there"},
+            {"tag": "text", "text": " "},
+        ]] + content
+    locale_key = "zh_cn" if looks_like_cjk(text) else "en_us"
+    post_body = {
+        "post": {
+            locale_key: {
+                "title": title,
+                "content": content,
+            }
+        }
+    }
+    payload = {
+        "msg_type": "post",
+        "content": json.dumps(post_body, ensure_ascii=False),
+    }
+    resp = requests.post(
+        f"https://open.larkoffice.com/open-apis/im/v1/messages/{reply_to_message_id}/reply",
+        headers=lark_headers(),
+        json=payload,
+        timeout=HTTP_TIMEOUT,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    return ((data.get("data") or {}).get("message_id"))
+
+
 def send_lark_image_reply(reply_to_message_id: str, image_key: str) -> str | None:
     payload = {
         "msg_type": "image",
@@ -1466,13 +1544,13 @@ def render_owner_reference(chat_id: str, owner_name: str, owner_email: str = "",
         if email_open_id:
             label = clean_name or clean_email
             return f'<at user_id="{email_open_id}">{label}</at>'
-        app.logger.info("Owner email could not be resolved for tag: name=%s email=%s", clean_name or raw_name, clean_email)
+        app.logger.warning("Owner email could not be resolved for tag: name=%s email=%s", clean_name or raw_name, clean_email)
     if not clean_name:
         return "Unassigned"
     open_id = lookup_owner_open_id(chat_id, clean_name)
     if open_id:
         return f'<at user_id="{open_id}">{clean_name}</at>'
-    app.logger.info("Owner name could not be resolved for tag: name=%s", clean_name)
+    app.logger.warning("Owner name could not be resolved for tag: name=%s", clean_name)
     return clean_name
 
 
@@ -2136,7 +2214,7 @@ def webhook():
 
             try:
                 meeting_reply = build_meeting_reply(chat_id, seg, meeting_url, meeting_mode)
-                msg_id = send_lark_text_reply(
+                msg_id = send_lark_post_reply(
                     message_id,
                     meeting_reply,
                     mention_open_id=sender_open_id,
