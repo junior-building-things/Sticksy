@@ -1003,12 +1003,25 @@ def fetch_lark_minute_media(minute_token: str) -> tuple[bytes, str] | tuple[None
         timeout=HTTP_TIMEOUT,
         allow_redirects=False,
     )
+    app.logger.info(
+        "Minutes media request: token=%s status=%s content_type=%s",
+        minute_token,
+        resp.status_code,
+        resp.headers.get("Content-Type"),
+    )
 
     if resp.status_code in {301, 302, 303, 307, 308} and resp.headers.get("Location"):
+        app.logger.info("Minutes media redirected: token=%s", minute_token)
         media_resp = requests.get(resp.headers["Location"], timeout=HTTP_TIMEOUT)
     elif resp.status_code < 400 and "application/json" in (resp.headers.get("Content-Type") or "").lower():
         body = resp.json()
         if body.get("code", 0) != 0:
+            app.logger.warning(
+                "Minutes media api error: token=%s code=%s msg=%s",
+                minute_token,
+                body.get("code"),
+                body.get("msg"),
+            )
             return (None, None)
         data = body.get("data") or {}
         download_url = (
@@ -1018,19 +1031,29 @@ def fetch_lark_minute_media(minute_token: str) -> tuple[bytes, str] | tuple[None
             or ((data.get("media") or {}).get("url"))
         )
         if not download_url:
+            app.logger.warning("Minutes media missing download URL: token=%s body=%s", minute_token, json.dumps(body)[:300])
             return (None, None)
         media_resp = requests.get(download_url, timeout=HTTP_TIMEOUT)
     elif resp.status_code < 400:
         media_resp = resp
     else:
+        app.logger.warning("Minutes media denied/unavailable: token=%s status=%s body=%s", minute_token, resp.status_code, resp.text[:300])
         return (None, None)
 
     if media_resp.status_code >= 400:
+        app.logger.warning("Minutes media download failed: token=%s status=%s", minute_token, media_resp.status_code)
         return (None, None)
     content = media_resp.content
     if not content or len(content) > MAX_MEETING_MEDIA_BYTES:
+        app.logger.warning(
+            "Minutes media empty/too large: token=%s size=%s max=%s",
+            minute_token,
+            len(content or b""),
+            MAX_MEETING_MEDIA_BYTES,
+        )
         return (None, None)
     mime_type = (media_resp.headers.get("Content-Type") or "audio/mp4").split(";")[0].strip() or "audio/mp4"
+    app.logger.info("Minutes media ready: token=%s size=%s mime=%s", minute_token, len(content), mime_type)
     return (content, mime_type)
 
 
@@ -1044,16 +1067,25 @@ def fetch_lark_minute_transcript(minute_token: str) -> str:
         timeout=HTTP_TIMEOUT,
         allow_redirects=False,
     )
+    app.logger.info(
+        "Minutes transcript request: token=%s status=%s content_type=%s",
+        minute_token,
+        resp.status_code,
+        resp.headers.get("Content-Type"),
+    )
 
     transcript_resp = None
     if resp.status_code in {301, 302, 303, 307, 308} and resp.headers.get("Location"):
+        app.logger.info("Minutes transcript redirected: token=%s", minute_token)
         transcript_resp = requests.get(resp.headers["Location"], timeout=HTTP_TIMEOUT)
     elif resp.status_code < 400:
         transcript_resp = resp
     else:
+        app.logger.warning("Minutes transcript denied/unavailable: token=%s status=%s body=%s", minute_token, resp.status_code, resp.text[:300])
         return ""
 
     if transcript_resp.status_code >= 400:
+        app.logger.warning("Minutes transcript download failed: token=%s status=%s", minute_token, transcript_resp.status_code)
         return ""
 
     content_type = (transcript_resp.headers.get("Content-Type") or "").lower()
@@ -1061,14 +1093,22 @@ def fetch_lark_minute_transcript(minute_token: str) -> str:
         text_payload = transcript_resp.text.strip()
         if len(text_payload) > MAX_MEETING_TRANSCRIPT_CHARS:
             text_payload = text_payload[:MAX_MEETING_TRANSCRIPT_CHARS]
+        app.logger.info("Minutes transcript plain text length=%s token=%s", len(text_payload), minute_token)
         return text_payload
 
     try:
         body = transcript_resp.json()
     except Exception:
+        app.logger.exception("Minutes transcript JSON parse failed: token=%s", minute_token)
         return ""
 
     if body.get("code", 0) not in {0, None}:
+        app.logger.warning(
+            "Minutes transcript api error: token=%s code=%s msg=%s",
+            minute_token,
+            body.get("code"),
+            body.get("msg"),
+        )
         return ""
 
     data = body.get("data") or {}
@@ -1079,6 +1119,7 @@ def fetch_lark_minute_transcript(minute_token: str) -> str:
         or (data.get("text") if isinstance(data.get("text"), str) else "")
     ).strip()
     if direct_text:
+        app.logger.info("Minutes transcript direct text length=%s token=%s", len(direct_text), minute_token)
         return direct_text[:MAX_MEETING_TRANSCRIPT_CHARS]
 
     download_url = (
@@ -1094,11 +1135,17 @@ def fetch_lark_minute_transcript(minute_token: str) -> str:
                 text_payload = download_resp.text.strip()
                 if len(text_payload) > MAX_MEETING_TRANSCRIPT_CHARS:
                     text_payload = text_payload[:MAX_MEETING_TRANSCRIPT_CHARS]
+                app.logger.info("Minutes transcript export downloaded length=%s token=%s", len(text_payload), minute_token)
                 return text_payload
+            app.logger.warning("Minutes transcript export download failed: token=%s status=%s", minute_token, download_resp.status_code)
         except Exception:
             app.logger.exception("Failed to download minute transcript export")
 
     extracted = extract_transcript_text_from_obj(data)
+    if extracted:
+        app.logger.info("Minutes transcript extracted from JSON length=%s token=%s", len(extracted), minute_token)
+    else:
+        app.logger.warning("Minutes transcript returned no usable text: token=%s payload=%s", minute_token, json.dumps(body)[:400])
     return extracted[:MAX_MEETING_TRANSCRIPT_CHARS] if extracted else ""
 
 
