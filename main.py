@@ -405,15 +405,11 @@ def send_lark_text_reply(reply_to_message_id: str, text: str, mention_open_id: s
 
 def build_post_content_from_text(text: str) -> tuple[str, list[list[dict]]]:
     lines = (text or "").splitlines()
-    title = ""
     content: list[list[dict]] = []
     at_pattern = re.compile(r'<at user_id="([^"]+)">(.+?)</at>', re.IGNORECASE)
 
     for raw_line in lines:
         line = raw_line.rstrip()
-        if not title and line.strip():
-            title = sanitize_text(re.sub(r"<at\b[^>]*>.*?</at>", "", line, flags=re.IGNORECASE)) or "Sticksy"
-            continue
         if not line.strip():
             continue
 
@@ -438,11 +434,9 @@ def build_post_content_from_text(text: str) -> tuple[str, list[list[dict]]]:
             paragraph = [{"tag": "text", "text": line}]
         content.append(paragraph)
 
-    if not title:
-        title = "Sticksy"
     if not content:
-        content = [[{"tag": "text", "text": text or title}]]
-    return title, content
+        content = [[{"tag": "text", "text": text or "Sticksy"}]]
+    return "", content
 
 
 def send_lark_post_reply(
@@ -453,10 +447,14 @@ def send_lark_post_reply(
 ) -> str | None:
     title, content = build_post_content_from_text(text)
     if mention_open_id:
-        content = [[
+        mention_parts = [
             {"tag": "at", "user_id": mention_open_id, "user_name": mention_name or "there"},
             {"tag": "text", "text": " "},
-        ]] + content
+        ]
+        if content:
+            content[0] = mention_parts + content[0]
+        else:
+            content = [mention_parts]
     locale_key = "zh_cn" if looks_like_cjk(text) else "en_us"
     post_body = {
         locale_key: {
