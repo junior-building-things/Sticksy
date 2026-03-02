@@ -1223,9 +1223,14 @@ def build_meeting_reply(chat_id: str, request_text: str, minute_url: str, mode: 
     if not minute_token:
         raise RuntimeError("invalid meeting transcript link")
 
-    minute_meta = fetch_lark_minute_meta(minute_token)
+    minute_meta = {}
+    try:
+        minute_meta = fetch_lark_minute_meta(minute_token)
+    except Exception:
+        app.logger.exception("Minutes meta unavailable; continuing with transcript/media only")
+
     transcript_text = fetch_lark_minute_transcript(minute_token)
-    if not transcript_text:
+    if not transcript_text and minute_meta:
         transcript_text = extract_transcript_text_from_obj(minute_meta)
     media_bytes = None
     media_mime_type = None
