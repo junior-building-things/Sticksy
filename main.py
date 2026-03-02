@@ -1467,6 +1467,82 @@ def extract_people_directory_from_text_blob(blob: str) -> list[dict]:
     return out
 
 
+def parse_json_like_blob(blob: str):
+    if not blob:
+        return None
+
+    candidates = []
+    stripped = blob.strip()
+    if stripped:
+        candidates.append(stripped)
+        candidates.append(html.unescape(stripped))
+
+    parse_match = re.search(r'JSON\.parse\(\s*"((?:\\.|[^"])*)"\s*\)', stripped, re.DOTALL)
+    if parse_match:
+        try:
+            decoded = json.loads(f'"{parse_match.group(1)}"')
+            if decoded:
+                candidates.append(decoded)
+        except Exception:
+            pass
+
+    for candidate in candidates:
+        text_candidate = candidate.strip() if isinstance(candidate, str) else candidate
+        if isinstance(text_candidate, str):
+            if not text_candidate:
+                continue
+            try:
+                return json.loads(text_candidate)
+            except Exception:
+                pass
+        else:
+            try:
+                return json.loads(text_candidate)
+            except Exception:
+                continue
+
+    return None
+
+
+def extract_people_directory_from_public_html(page_text: str) -> list[dict]:
+    if not page_text:
+        return []
+
+    blobs: list[str] = []
+    script_patterns = [
+        re.compile(r'<script[^>]*id="__NEXT_DATA__"[^>]*>(.*?)</script>', re.IGNORECASE | re.DOTALL),
+        re.compile(r'<script[^>]*>\s*window\.__INITIAL_STATE__\s*=\s*(.*?);\s*</script>', re.IGNORECASE | re.DOTALL),
+        re.compile(r'<script[^>]*>\s*window\.__NUXT__\s*=\s*(.*?);\s*</script>', re.IGNORECASE | re.DOTALL),
+        re.compile(r'window\.__INITIAL_STATE__\s*=\s*(\{.*?\})\s*;', re.IGNORECASE | re.DOTALL),
+        re.compile(r'window\.__NEXT_DATA__\s*=\s*(\{.*?\})\s*;', re.IGNORECASE | re.DOTALL),
+    ]
+    for pattern in script_patterns:
+        for match in pattern.finditer(page_text):
+            blob = (match.group(1) or "").strip()
+            if blob:
+                blobs.append(blob)
+
+    seen_blob = set()
+    collected: list[dict] = []
+    for blob in blobs:
+        if blob in seen_blob:
+            continue
+        seen_blob.add(blob)
+        parsed = parse_json_like_blob(blob)
+        if parsed is None:
+            continue
+        collected = merge_people_directories(
+            collected,
+            extract_participant_directory_from_obj(parsed),
+            extract_speaker_directory_from_obj(parsed),
+        )
+
+    if collected:
+        return collected
+
+    return extract_people_directory_from_text_blob(page_text)
+
+
 def fetch_public_minute_page_people(minute_url: str) -> list[dict]:
     if not minute_url:
         return []
@@ -1491,8 +1567,11 @@ def fetch_public_minute_page_people(minute_url: str) -> list[dict]:
             app.logger.warning("Public minute page empty: url=%s", minute_url)
             return []
 
-        people = extract_people_directory_from_text_blob(page_text)
-        app.logger.info("Public minute page people extracted: url=%s count=%s", minute_url, len(people))
+        people = extract_people_directory_from_public_html(page_text)
+        if people:
+            app.logger.info("Public minute page people extracted: url=%s count=%s", minute_url, len(people))
+        else:
+            app.logger.warning("Public minute page yielded no people: url=%s", minute_url)
         return people
     except Exception:
         app.logger.exception("Failed fetching public minute page: url=%s", minute_url)
