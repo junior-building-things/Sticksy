@@ -1764,8 +1764,8 @@ def extract_open_ids_from_obj(obj) -> set[str]:
                                 sv = sub_val.strip()
                                 if sv.startswith("ou_") and len(sv) > 3:
                                     ids.add(sv)
-                for v in node.values():
-                    walk(v)
+            for v in node.values():
+                walk(v)
             return
         if isinstance(node, list):
             for item in node:
