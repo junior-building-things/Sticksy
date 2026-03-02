@@ -1953,7 +1953,7 @@ def batch_lookup_open_ids_by_email(emails: list[str]) -> dict[str, str]:
 
 def enrich_speaker_directory(speaker_directory: list[dict], chat_id: str) -> list[dict]:
     chat_members = fetch_chat_member_directory(chat_id)
-    app.logger.info("Enrichment: chat_members=%s for chat_id=%s", len(chat_members), chat_id)
+    app.logger.warning("Enrichment: chat_members=%s for chat_id=%s", len(chat_members), chat_id)
 
     member_by_normalized_name: dict[str, dict] = {}
     unnamed_resolved = 0
@@ -1971,7 +1971,7 @@ def enrich_speaker_directory(speaker_directory: list[dict], chat_id: str) -> lis
         key = normalize_person_name(member_name)
         if key:
             member_by_normalized_name[key] = {"open_id": member_open_id, "name": member_name}
-    app.logger.info("Enrichment: member_name_map=%s unnamed_resolved=%s", len(member_by_normalized_name), unnamed_resolved)
+    app.logger.warning("Enrichment: member_name_map=%s unnamed_resolved=%s", len(member_by_normalized_name), unnamed_resolved)
 
     for entry in speaker_directory:
         if (entry.get("open_id") or "").strip():
@@ -2443,7 +2443,7 @@ def build_meeting_reply(chat_id: str, request_text: str, minute_url: str, mode: 
     pre_enrich_count = len(speaker_directory)
     speaker_directory = enrich_speaker_directory(speaker_directory, chat_id)
     enriched_with_id = sum(1 for e in speaker_directory if (e.get("open_id") or "").strip())
-    app.logger.info(
+    app.logger.warning(
         "Speaker directory enriched: token=%s before=%s after=%s with_open_id=%s",
         minute_token,
         pre_enrich_count,
