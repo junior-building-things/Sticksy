@@ -1205,11 +1205,18 @@ def fetch_chat_member_directory(chat_id: str) -> list[dict]:
             data = body.get("data") or {}
             items = data.get("items") or []
             for item in items:
+                member_id = item.get("member_id") or {}
+                if isinstance(member_id, str):
+                    member_open_id = member_id.strip()
+                else:
+                    member_open_id = (
+                        (member_id.get("open_id") if isinstance(member_id, dict) else "")
+                        or (member_id.get("user_id") if isinstance(member_id, dict) else "")
+                        or (member_id.get("id") if isinstance(member_id, dict) else "")
+                        or (item.get("open_id") or "")
+                    )
                 member_open_id = (
-                    ((item.get("member_id") or {}).get("open_id"))
-                    or ((item.get("member_id") or {}).get("user_id"))
-                    or ((item.get("member_id") or {}).get("id"))
-                    or (item.get("open_id") or "")
+                    (member_open_id or "").strip()
                 )
                 member_name = (item.get("name") or item.get("display_name") or item.get("member_name") or "").strip()
                 key = (member_open_id, member_name)
@@ -1248,13 +1255,6 @@ def known_people_for_chat(chat_id: str, limit: int = 200) -> list[str]:
     )
     for row in rows:
         name = (row.get("sender_name") or "").strip()
-        key = normalize_person_name(name)
-        if name and key and key not in seen and key != "unknown":
-            seen.add(key)
-            names.append(name)
-
-    for member in fetch_chat_member_directory(chat_id):
-        name = (member.get("display_name") or "").strip()
         key = normalize_person_name(name)
         if name and key and key not in seen and key != "unknown":
             seen.add(key)
@@ -1326,11 +1326,6 @@ def lookup_owner_open_id(chat_id: str, owner_name: str) -> str:
         if person_name_matches(sender_name, target):
             return (row.get("sender_open_id") or "").strip()
 
-    for member in fetch_chat_member_directory(chat_id):
-        display_name = (member.get("display_name") or "").strip()
-        if person_name_matches(display_name, target):
-            return (member.get("open_id") or "").strip()
-
     cached = db_query_all(
         """
         SELECT open_id, display_name
@@ -1350,8 +1345,14 @@ def lookup_owner_open_id(chat_id: str, owner_name: str) -> str:
 
 
 def render_owner_reference(chat_id: str, owner_name: str, owner_email: str = "") -> str:
-    clean_name = (owner_name or "").strip()
+    raw_name = (owner_name or "").strip()
+    clean_name = raw_name
     clean_email = (owner_email or "").strip()
+    if not clean_email:
+        email_match = re.search(r"([A-Z0-9._%+\-]+@[A-Z0-9.\-]+\.[A-Z]{2,})", raw_name, re.IGNORECASE)
+        if email_match:
+            clean_email = email_match.group(1)
+            clean_name = sanitize_text(raw_name.replace(clean_email, "").strip("()<> -")) or clean_name
     if clean_email:
         email_open_id = lookup_open_id_by_email(clean_email)
         if email_open_id:
