@@ -44,6 +44,8 @@ MAX_SUMMARY_IMAGES = 3
 MAX_SUMMARY_MESSAGES = 350
 TOPIC_WINDOW_HOURS = 6
 MAX_STICKER_UPLOAD_BYTES = int(os.environ.get("MAX_STICKER_UPLOAD_BYTES", "9500000"))
+MAX_MEETING_TRANSCRIPT_CHARS = int(os.environ.get("MAX_MEETING_TRANSCRIPT_CHARS", "120000"))
+MAX_MEETING_MEDIA_BYTES = int(os.environ.get("MAX_MEETING_MEDIA_BYTES", "18000000"))
 
 client = genai.Client(api_key=GEMINI_API_KEY)
 
@@ -94,6 +96,26 @@ Rules:
 - The query should serve as a fun and cheeky reply to the user's message. Add a playful twist where possible.
 - Preserve the user's language when possible.
 - Keep most queries 1-2 words. Avoid more than 3 unless it's a specific term (e.g. kpop demon hunters).
+""".strip()
+
+MEETING_SUMMARY_SYSTEM_PROMPT = """
+You are Sticksy, a concise meeting summarizer.
+Return JSON only with this schema:
+{
+  "summary_bullets": ["string"],
+  "next_steps": [
+    {"owner_name":"string","task":"string"}
+  ]
+}
+
+Rules:
+- Preserve the language of the user's request.
+- Use the meeting transcript or meeting media as the source of truth.
+- Always synthesize; do not copy long transcript lines verbatim.
+- summary_bullets should be concise key takeaways with no labels.
+- next_steps should capture owner-specific action items when the owner is clear.
+- If an owner is unclear, leave owner_name empty rather than guessing.
+- Keep next steps concrete and brief.
 """.strip()
 
 
@@ -873,6 +895,294 @@ def create_summary(query: str, asker_name: str, language_hint: str, rows: list[d
     return summary_text, selected
 
 
+def extract_minutes_url(text: str) -> str:
+    match = re.search(r"https?://[^\s]+/minutes/[A-Za-z0-9]+[^\s]*", text or "", re.IGNORECASE)
+    return match.group(0).rstrip(").,]") if match else ""
+
+
+def extract_minutes_token(minutes_url: str) -> str:
+    match = re.search(r"/minutes/([A-Za-z0-9]+)", minutes_url or "", re.IGNORECASE)
+    return match.group(1) if match else ""
+
+
+def meeting_request_mode(text: str) -> str:
+    lowered = (text or "").lower()
+    has_url = bool(extract_minutes_url(text))
+    has_meeting_hint = any(word in lowered for word in ["meeting", "minutes", "transcript", "会议", "會議", "纪要", "紀要"])
+    next_steps_hint = any(phrase in lowered for phrase in ["next steps", "action items", "todos", "todo", "下一步", "待办", "待辦"])
+    summary_hint = looks_like_summary_request(text)
+
+    if next_steps_hint and (has_url or has_meeting_hint):
+        return "next_steps"
+    if has_url:
+        return "summary"
+    if summary_hint and has_meeting_hint:
+        return "summary"
+    return ""
+
+
+def find_last_meeting_url(chat_id: str, limit: int = 80) -> str:
+    rows = db_query_all(
+        """
+        SELECT text_content
+        FROM messages
+        WHERE chat_id = :chat_id
+          AND text_content IS NOT NULL
+          AND text_content <> ''
+        ORDER BY created_at_ts DESC
+        LIMIT :limit_rows
+        """,
+        {"chat_id": chat_id, "limit_rows": limit},
+    )
+    for row in rows:
+        url = extract_minutes_url(row.get("text_content") or "")
+        if url:
+            return url
+    return ""
+
+
+def lark_auth_headers() -> dict:
+    return {"Authorization": f"Bearer {get_tenant_access_token()}"}
+
+
+def fetch_lark_minute_meta(minute_token: str) -> dict:
+    if not minute_token:
+        return {}
+    resp = requests.get(
+        f"https://open.larkoffice.com/open-apis/minutes/v1/minutes/{minute_token}",
+        headers=lark_auth_headers(),
+        timeout=HTTP_TIMEOUT,
+    )
+    if resp.status_code >= 400:
+        raise RuntimeError(f"minute meta fetch failed status={resp.status_code}: {resp.text[:300]}")
+    body = resp.json()
+    if body.get("code", 0) != 0:
+        raise RuntimeError(f"minute meta api error code={body.get('code')} msg={body.get('msg')}")
+    return (body.get("data") or {})
+
+
+def extract_transcript_text_from_obj(obj) -> str:
+    text_parts: list[str] = []
+
+    def walk(node, parent_key: str = ""):
+        if isinstance(node, dict):
+            for key, value in node.items():
+                key_l = str(key).lower()
+                if isinstance(value, str):
+                    val = value.strip()
+                    if not val:
+                        continue
+                    if val.startswith("http://") or val.startswith("https://"):
+                        continue
+                    if key_l in {
+                        "text", "content", "paragraph_text", "sentence_text",
+                        "transcript", "topic", "summary", "speaker", "speaker_name",
+                    }:
+                        text_parts.append(val)
+                else:
+                    walk(value, key_l)
+        elif isinstance(node, list):
+            for item in node:
+                walk(item, parent_key)
+
+    walk(obj)
+    merged = "\n".join(text_parts)
+    merged = re.sub(r"\n{3,}", "\n\n", merged).strip()
+    if len(merged) > MAX_MEETING_TRANSCRIPT_CHARS:
+        merged = merged[:MAX_MEETING_TRANSCRIPT_CHARS]
+    return merged
+
+
+def fetch_lark_minute_media(minute_token: str) -> tuple[bytes, str] | tuple[None, None]:
+    if not minute_token:
+        return (None, None)
+
+    resp = requests.get(
+        f"https://open.larkoffice.com/open-apis/minutes/v1/minutes/{minute_token}/media",
+        headers=lark_auth_headers(),
+        timeout=HTTP_TIMEOUT,
+        allow_redirects=False,
+    )
+
+    if resp.status_code in {301, 302, 303, 307, 308} and resp.headers.get("Location"):
+        media_resp = requests.get(resp.headers["Location"], timeout=HTTP_TIMEOUT)
+    elif resp.status_code < 400 and "application/json" in (resp.headers.get("Content-Type") or "").lower():
+        body = resp.json()
+        if body.get("code", 0) != 0:
+            return (None, None)
+        data = body.get("data") or {}
+        download_url = (
+            data.get("download_url")
+            or data.get("url")
+            or ((data.get("media") or {}).get("download_url"))
+            or ((data.get("media") or {}).get("url"))
+        )
+        if not download_url:
+            return (None, None)
+        media_resp = requests.get(download_url, timeout=HTTP_TIMEOUT)
+    elif resp.status_code < 400:
+        media_resp = resp
+    else:
+        return (None, None)
+
+    if media_resp.status_code >= 400:
+        return (None, None)
+    content = media_resp.content
+    if not content or len(content) > MAX_MEETING_MEDIA_BYTES:
+        return (None, None)
+    mime_type = (media_resp.headers.get("Content-Type") or "audio/mp4").split(";")[0].strip() or "audio/mp4"
+    return (content, mime_type)
+
+
+def lookup_owner_open_id(chat_id: str, owner_name: str) -> str:
+    target = (owner_name or "").strip()
+    if not target:
+        return ""
+    target_l = target.lower()
+
+    rows = db_query_all(
+        """
+        SELECT sender_open_id, sender_name
+        FROM messages
+        WHERE chat_id = :chat_id
+          AND sender_open_id IS NOT NULL
+          AND sender_open_id <> ''
+          AND sender_name IS NOT NULL
+          AND sender_name <> ''
+        ORDER BY created_at_ts DESC
+        LIMIT 200
+        """,
+        {"chat_id": chat_id},
+    )
+    for row in rows:
+        sender_name = (row.get("sender_name") or "").strip()
+        if sender_name and sender_name.lower() == target_l:
+            return (row.get("sender_open_id") or "").strip()
+    for row in rows:
+        sender_name = (row.get("sender_name") or "").strip()
+        if sender_name and (target_l in sender_name.lower() or sender_name.lower() in target_l):
+            return (row.get("sender_open_id") or "").strip()
+
+    cached = db_query_all(
+        """
+        SELECT open_id, display_name
+        FROM user_profile_cache
+        WHERE display_name IS NOT NULL
+          AND display_name <> ''
+        ORDER BY cached_at_ts DESC
+        LIMIT 200
+        """
+    )
+    for row in cached:
+        display_name = (row.get("display_name") or "").strip()
+        if display_name and display_name.lower() == target_l:
+            return (row.get("open_id") or "").strip()
+    for row in cached:
+        display_name = (row.get("display_name") or "").strip()
+        if display_name and (target_l in display_name.lower() or display_name.lower() in target_l):
+            return (row.get("open_id") or "").strip()
+
+    return ""
+
+
+def render_owner_reference(chat_id: str, owner_name: str) -> str:
+    clean_name = (owner_name or "").strip()
+    if not clean_name:
+        return "Unassigned"
+    open_id = lookup_owner_open_id(chat_id, clean_name)
+    if open_id:
+        return f'<at user_id="{open_id}">{clean_name}</at>'
+    return clean_name
+
+
+def analyze_meeting_with_gemini(request_text: str, minute_url: str, minute_meta: dict, transcript_text: str, media_bytes: bytes | None, media_mime_type: str | None) -> dict:
+    user_payload = {
+        "request": request_text,
+        "minute_url": minute_url,
+        "minute_meta": minute_meta,
+        "transcript_excerpt": transcript_text,
+    }
+    parts = [
+        types.Part.from_text(text=json.dumps(user_payload, ensure_ascii=False)),
+    ]
+    if media_bytes and media_mime_type:
+        parts.append(types.Part.from_bytes(data=media_bytes, mime_type=media_mime_type))
+
+    config = types.GenerateContentConfig(
+        system_instruction=MEETING_SUMMARY_SYSTEM_PROMPT,
+        response_mime_type="application/json",
+    )
+    response = client.models.generate_content(
+        model=GEMINI_MODEL,
+        contents=[types.Content(role="user", parts=parts)],
+        config=config,
+    )
+    raw = (response.text or "").strip()
+    return json.loads(raw)
+
+
+def format_meeting_reply(chat_id: str, mode: str, parsed: dict, meeting_title: str = "") -> str:
+    summary_bullets = []
+    for item in parsed.get("summary_bullets") or []:
+        text_item = (item or "").strip()
+        if text_item:
+            summary_bullets.append(f"- {text_item}")
+
+    next_step_lines = []
+    for item in parsed.get("next_steps") or []:
+        task = (item.get("task") or "").strip()
+        if not task:
+            continue
+        owner_ref = render_owner_reference(chat_id, item.get("owner_name") or "")
+        next_step_lines.append(f"- {owner_ref}: {task}")
+
+    header = "Next steps from the meeting:" if mode == "next_steps" else "Meeting summary:"
+    if meeting_title:
+        header = f'{header} {meeting_title}'
+
+    sections = [header]
+    if mode != "next_steps" and summary_bullets:
+        sections.append("\n".join(summary_bullets))
+    if next_step_lines:
+        if mode != "next_steps":
+            sections.append("Next steps:")
+        sections.append("\n".join(next_step_lines))
+    return "\n".join(s for s in sections if s)
+
+
+def build_meeting_reply(chat_id: str, request_text: str, minute_url: str, mode: str) -> str:
+    minute_token = extract_minutes_token(minute_url)
+    if not minute_token:
+        raise RuntimeError("invalid meeting transcript link")
+
+    minute_meta = fetch_lark_minute_meta(minute_token)
+    transcript_text = extract_transcript_text_from_obj(minute_meta)
+    media_bytes = None
+    media_mime_type = None
+
+    if len(transcript_text) < 800:
+        media_bytes, media_mime_type = fetch_lark_minute_media(minute_token)
+
+    if not transcript_text and not media_bytes:
+        raise RuntimeError("meeting transcript is not accessible yet")
+
+    parsed = analyze_meeting_with_gemini(
+        request_text=request_text,
+        minute_url=minute_url,
+        minute_meta=minute_meta,
+        transcript_text=transcript_text,
+        media_bytes=media_bytes,
+        media_mime_type=media_mime_type,
+    )
+
+    title = (
+        (minute_meta.get("title") or "").strip()
+        or ((minute_meta.get("minute") or {}).get("title") or "").strip()
+        or ((minute_meta.get("item") or {}).get("title") or "").strip()
+    )
+    return format_meeting_reply(chat_id, mode, parsed, meeting_title=title)
+
+
 def send_missing_history_message(reply_to_message_id: str, chat_id: str):
     if THOMAS_OPEN_ID:
         text = "I don't have access to historical messages yet, let's check what's going on!"
@@ -1390,7 +1700,51 @@ def webhook():
         if not seg:
             continue
 
-        if looks_like_summary_request(seg):
+        meeting_mode = meeting_request_mode(seg)
+        if meeting_mode:
+            meeting_url = extract_minutes_url(seg) or find_last_meeting_url(chat_id)
+            if not meeting_url:
+                try:
+                    missing_meeting = "I couldn't find a recent meeting transcript link in this chat yet."
+                    msg_id = send_lark_text_reply(
+                        message_id,
+                        missing_meeting,
+                        mention_open_id=sender_open_id,
+                        mention_name=sender_name,
+                    )
+                    remember_bot_message(msg_id, chat_id)
+                    save_bot_text(chat_id, missing_meeting, root_id, message_id, event_message_id=msg_id)
+                except Exception:
+                    app.logger.exception("Failed to send missing-meeting-link reply")
+                continue
+
+            try:
+                meeting_reply = build_meeting_reply(chat_id, seg, meeting_url, meeting_mode)
+                msg_id = send_lark_text_reply(
+                    message_id,
+                    meeting_reply,
+                    mention_open_id=sender_open_id,
+                    mention_name=sender_name,
+                )
+                remember_bot_message(msg_id, chat_id)
+                save_bot_text(chat_id, meeting_reply, root_id, message_id, event_message_id=msg_id)
+            except Exception:
+                app.logger.exception("Meeting summary/send failed")
+                try:
+                    unavailable_text = "I couldn't access that meeting transcript yet."
+                    msg_id = send_lark_text_reply(
+                        message_id,
+                        unavailable_text,
+                        mention_open_id=sender_open_id,
+                        mention_name=sender_name,
+                    )
+                    remember_bot_message(msg_id, chat_id)
+                    save_bot_text(chat_id, unavailable_text, root_id, message_id, event_message_id=msg_id)
+                except Exception:
+                    app.logger.exception("Failed to send meeting-unavailable reply")
+                continue
+
+        elif looks_like_summary_request(seg):
             window = parse_time_window(seg, user_tz)
             rows = load_messages_for_window(chat_id, window.start_ts, window.end_ts, root_id if message.get("root_id") else None)
             if not rows:
