@@ -1117,6 +1117,80 @@ def extract_transcript_text_from_obj(obj) -> str:
     return merged
 
 
+def first_nested_string(node, keys: set[str], max_depth: int = 1) -> str:
+    if max_depth < 0:
+        return ""
+    if isinstance(node, dict):
+        for key, value in node.items():
+            key_l = str(key).lower()
+            if key_l in keys and isinstance(value, str) and value.strip():
+                return value.strip()
+        if max_depth > 0:
+            for value in node.values():
+                found = first_nested_string(value, keys, max_depth=max_depth - 1)
+                if found:
+                    return found
+    elif isinstance(node, list) and max_depth > 0:
+        for item in node:
+            found = first_nested_string(item, keys, max_depth=max_depth - 1)
+            if found:
+                return found
+    return ""
+
+
+def first_nested_id(node, max_depth: int = 1) -> str:
+    if max_depth < 0:
+        return ""
+    if isinstance(node, dict):
+        for key, value in node.items():
+            key_l = str(key).lower()
+            if key_l in {"open_id", "user_id", "id"} and isinstance(value, str) and value.strip():
+                return value.strip()
+            if key_l == "member_id":
+                if isinstance(value, str) and value.strip():
+                    return value.strip()
+                if isinstance(value, dict):
+                    nested_id = (
+                        (value.get("open_id") or "").strip()
+                        or (value.get("user_id") or "").strip()
+                        or (value.get("id") or "").strip()
+                    )
+                    if nested_id:
+                        return nested_id
+        if max_depth > 0:
+            for value in node.values():
+                found = first_nested_id(value, max_depth=max_depth - 1)
+                if found:
+                    return found
+    elif isinstance(node, list) and max_depth > 0:
+        for item in node:
+            found = first_nested_id(item, max_depth=max_depth - 1)
+            if found:
+                return found
+    return ""
+
+
+def decode_response_text(resp: requests.Response) -> str:
+    payload = resp.content or b""
+    if not payload:
+        return ""
+    for encoding in ("utf-8", "utf-8-sig"):
+        try:
+            return payload.decode(encoding).strip()
+        except Exception:
+            pass
+    apparent = getattr(resp, "apparent_encoding", None)
+    if apparent:
+        try:
+            return payload.decode(apparent, errors="replace").strip()
+        except Exception:
+            pass
+    try:
+        return resp.text.strip()
+    except Exception:
+        return payload.decode("latin-1", errors="replace").strip()
+
+
 def extract_speaker_directory_from_obj(obj) -> list[dict]:
     out: list[dict] = []
     seen: set[tuple[str, str]] = set()
@@ -1127,14 +1201,8 @@ def extract_speaker_directory_from_obj(obj) -> list[dict]:
     def maybe_add(node):
         if not isinstance(node, dict):
             return
-        speaker_name = ""
-        speaker_email = ""
-        for key, value in node.items():
-            key_l = str(key).lower()
-            if key_l in name_keys and isinstance(value, str) and value.strip() and not speaker_name:
-                speaker_name = sanitize_text(value.strip())
-            if key_l in email_keys and isinstance(value, str) and value.strip() and not speaker_email:
-                speaker_email = value.strip().lower()
+        speaker_name = sanitize_text(first_nested_string(node, name_keys, max_depth=1))
+        speaker_email = first_nested_string(node, email_keys, max_depth=1).lower()
         if speaker_name and speaker_email:
             pair_key = (normalize_person_name(speaker_name), speaker_email)
             if pair_key[0] and pair_key not in seen:
@@ -1165,28 +1233,9 @@ def extract_participant_directory_from_obj(obj) -> list[dict]:
         if not isinstance(node, dict):
             return
 
-        participant_name = ""
-        participant_email = ""
-        participant_open_id = ""
-
-        for key, value in node.items():
-            key_l = str(key).lower()
-            if key_l in name_keys and isinstance(value, str) and value.strip() and not participant_name:
-                participant_name = sanitize_text(value.strip())
-            if key_l in email_keys and isinstance(value, str) and value.strip() and not participant_email:
-                participant_email = value.strip().lower()
-            if key_l == "open_id" and isinstance(value, str) and value.strip() and not participant_open_id:
-                participant_open_id = value.strip()
-            if key_l == "user_id" and isinstance(value, str) and value.strip() and not participant_open_id:
-                participant_open_id = value.strip()
-            if key_l == "member_id":
-                if isinstance(value, str) and value.strip() and not participant_open_id:
-                    participant_open_id = value.strip()
-                elif isinstance(value, dict) and not participant_open_id:
-                    participant_open_id = (
-                        (value.get("open_id") or "").strip()
-                        or (value.get("user_id") or "").strip()
-                    )
+        participant_name = sanitize_text(first_nested_string(node, name_keys, max_depth=1))
+        participant_email = first_nested_string(node, email_keys, max_depth=1).lower()
+        participant_open_id = first_nested_id(node, max_depth=1)
 
         if not participant_name:
             return
@@ -1336,7 +1385,7 @@ def fetch_lark_minute_transcript(minute_token: str) -> str:
 
     content_type = (transcript_resp.headers.get("Content-Type") or "").lower()
     if "application/json" not in content_type:
-        text_payload = transcript_resp.text.strip()
+        text_payload = decode_response_text(transcript_resp)
         if len(text_payload) > MAX_MEETING_TRANSCRIPT_CHARS:
             text_payload = text_payload[:MAX_MEETING_TRANSCRIPT_CHARS]
         app.logger.info("Minutes transcript plain text length=%s token=%s", len(text_payload), minute_token)
@@ -1386,7 +1435,7 @@ def fetch_lark_minute_transcript(minute_token: str) -> str:
         try:
             download_resp = requests.get(download_url, timeout=HTTP_TIMEOUT)
             if download_resp.status_code < 400:
-                text_payload = download_resp.text.strip()
+                text_payload = decode_response_text(download_resp)
                 if speaker_prefix:
                     text_payload = f"{speaker_prefix}\n{text_payload}".strip()
                 if len(text_payload) > MAX_MEETING_TRANSCRIPT_CHARS:
@@ -1883,6 +1932,13 @@ def build_meeting_reply(chat_id: str, request_text: str, minute_url: str, mode: 
         len(participant_directory),
         len(speaker_directory),
     )
+    if not speaker_directory:
+        app.logger.warning(
+            "Meeting people directory empty: token=%s transcript=%s participants=%s",
+            minute_token,
+            len(transcript_directory),
+            len(participant_directory),
+        )
     for item in speaker_directory:
         speaker_name = (item.get("name") or "").strip()
         if not speaker_name:
