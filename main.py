@@ -458,11 +458,9 @@ def send_lark_post_reply(
         ]] + content
     locale_key = "zh_cn" if looks_like_cjk(text) else "en_us"
     post_body = {
-        "post": {
-            locale_key: {
-                "title": title,
-                "content": content,
-            }
+        locale_key: {
+            "title": title,
+            "content": content,
         }
     }
     payload = {
@@ -475,7 +473,9 @@ def send_lark_post_reply(
         json=payload,
         timeout=HTTP_TIMEOUT,
     )
-    resp.raise_for_status()
+    if resp.status_code >= 400:
+        app.logger.warning("Lark post reply failed status=%s body=%s", resp.status_code, resp.text[:500])
+        raise RuntimeError(f"lark post reply failed status={resp.status_code}: {resp.text[:300]}")
     data = resp.json()
     return ((data.get("data") or {}).get("message_id"))
 
@@ -1074,6 +1074,43 @@ def extract_transcript_text_from_obj(obj) -> str:
     return merged
 
 
+def extract_speaker_directory_from_obj(obj) -> list[dict]:
+    out: list[dict] = []
+    seen: set[tuple[str, str]] = set()
+
+    name_keys = {"speaker", "speaker_name", "name", "user_name", "display_name"}
+    email_keys = {"email", "speaker_email", "user_email", "email_address"}
+
+    def maybe_add(node):
+        if not isinstance(node, dict):
+            return
+        speaker_name = ""
+        speaker_email = ""
+        for key, value in node.items():
+            key_l = str(key).lower()
+            if key_l in name_keys and isinstance(value, str) and value.strip() and not speaker_name:
+                speaker_name = sanitize_text(value.strip())
+            if key_l in email_keys and isinstance(value, str) and value.strip() and not speaker_email:
+                speaker_email = value.strip().lower()
+        if speaker_name and speaker_email:
+            pair_key = (normalize_person_name(speaker_name), speaker_email)
+            if pair_key[0] and pair_key not in seen:
+                seen.add(pair_key)
+                out.append({"name": speaker_name, "email": speaker_email})
+
+    def walk(node):
+        if isinstance(node, dict):
+            maybe_add(node)
+            for value in node.values():
+                walk(value)
+        elif isinstance(node, list):
+            for item in node:
+                walk(item)
+
+    walk(obj)
+    return out
+
+
 def fetch_lark_minute_media(minute_token: str) -> tuple[bytes, str] | tuple[None, None]:
     if not minute_token:
         return (None, None)
@@ -1193,6 +1230,12 @@ def fetch_lark_minute_transcript(minute_token: str) -> str:
         return ""
 
     data = body.get("data") or {}
+    speaker_directory = extract_speaker_directory_from_obj(data)
+    speaker_prefix = "\n".join(
+        f'{(item.get("name") or "").strip()} <{(item.get("email") or "").strip()}>'
+        for item in speaker_directory
+        if (item.get("name") or "").strip() and (item.get("email") or "").strip()
+    ).strip()
 
     direct_text = (
         (data.get("transcript") if isinstance(data.get("transcript"), str) else "")
@@ -1200,6 +1243,8 @@ def fetch_lark_minute_transcript(minute_token: str) -> str:
         or (data.get("text") if isinstance(data.get("text"), str) else "")
     ).strip()
     if direct_text:
+        if speaker_prefix:
+            direct_text = f"{speaker_prefix}\n{direct_text}".strip()
         app.logger.info("Minutes transcript direct text length=%s token=%s", len(direct_text), minute_token)
         return direct_text[:MAX_MEETING_TRANSCRIPT_CHARS]
 
@@ -1214,6 +1259,8 @@ def fetch_lark_minute_transcript(minute_token: str) -> str:
             download_resp = requests.get(download_url, timeout=HTTP_TIMEOUT)
             if download_resp.status_code < 400:
                 text_payload = download_resp.text.strip()
+                if speaker_prefix:
+                    text_payload = f"{speaker_prefix}\n{text_payload}".strip()
                 if len(text_payload) > MAX_MEETING_TRANSCRIPT_CHARS:
                     text_payload = text_payload[:MAX_MEETING_TRANSCRIPT_CHARS]
                 app.logger.info("Minutes transcript export downloaded length=%s token=%s", len(text_payload), minute_token)
@@ -1223,6 +1270,8 @@ def fetch_lark_minute_transcript(minute_token: str) -> str:
             app.logger.exception("Failed to download minute transcript export")
 
     extracted = extract_transcript_text_from_obj(data)
+    if speaker_prefix:
+        extracted = f"{speaker_prefix}\n{extracted}".strip()
     if extracted:
         app.logger.info("Minutes transcript extracted from JSON length=%s token=%s", len(extracted), minute_token)
     else:
