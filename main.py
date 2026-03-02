@@ -1291,12 +1291,22 @@ def lookup_open_id_by_email(email: str) -> str:
         data = body.get("data") or {}
         user_list = data.get("user_list") or []
         for item in user_list:
-            if ((item.get("email") or "").strip().lower() == target) and (item.get("open_id") or "").strip():
-                return item.get("open_id").strip()
+            resolved_id = (
+                (item.get("open_id") or "").strip()
+                or (item.get("user_id") or "").strip()
+                or (item.get("id") or "").strip()
+            )
+            if ((item.get("email") or "").strip().lower() == target) and resolved_id:
+                return resolved_id
         if user_list:
-            open_id = (user_list[0].get("open_id") or "").strip()
-            if open_id:
-                return open_id
+            resolved_id = (
+                (user_list[0].get("open_id") or "").strip()
+                or (user_list[0].get("user_id") or "").strip()
+                or (user_list[0].get("id") or "").strip()
+            )
+            if resolved_id:
+                return resolved_id
+        app.logger.warning("Email lookup returned no matching user id for email=%s", target)
     except Exception:
         app.logger.exception("Email lookup exception email=%s", target)
 
