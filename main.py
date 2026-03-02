@@ -1891,13 +1891,13 @@ def format_meeting_reply(
     speaker_directory: list[dict] | None = None,
 ) -> str:
     summary_bullets = []
-    for item in parsed.get("summary_bullets") or []:
+    for idx, item in enumerate(parsed.get("summary_bullets") or [], start=1):
         text_item = (item or "").strip()
         if text_item:
-            summary_bullets.append(f"• {text_item}")
+            summary_bullets.append(f"{idx}. {text_item}")
 
     next_step_lines = []
-    for item in parsed.get("next_steps") or []:
+    for idx, item in enumerate(parsed.get("next_steps") or [], start=1):
         task = (item.get("task") or "").strip()
         if not task:
             continue
@@ -1907,7 +1907,7 @@ def format_meeting_reply(
             item.get("owner_email") or "",
             speaker_directory=speaker_directory,
         )
-        next_step_lines.append(f"• {owner_ref}: {task}")
+        next_step_lines.append(f"{idx}. {owner_ref}: {task}")
 
     header = "Next steps:" if mode == "next_steps" else "Meeting summary:"
 
