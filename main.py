@@ -63,6 +63,7 @@ Rules:
 - Output JSON only.
 - Focus on important topics. If many topics exist, keep lower-priority topics very short.
 - Attribute claims to specific speaker names when possible.
+- Use any provided learned terminology exactly when relevant.
 - Always produce a summary, even when content is sparse.
 - Synthesize and compress; do not copy chat lines verbatim.
 
@@ -114,6 +115,7 @@ Rules:
 - Prefer owner names that exactly match the provided known participant names when applicable.
 - Never translate, localize, or romanize people's names. Preserve person names exactly as they appear in the transcript or known_people.
 - If the transcript includes a speaker email, include it in owner_email.
+- Use any provided learned terminology exactly when relevant.
 - Always synthesize; do not copy long transcript lines verbatim.
 - summary_bullets should be concise key takeaways with no labels.
 - next_steps should capture owner-specific action items when the owner is clear.
@@ -217,6 +219,16 @@ def init_db():
               cached_at_ts BIGINT NOT NULL
             )
             """,
+            """
+            CREATE TABLE IF NOT EXISTS learned_terms (
+              chat_id TEXT NOT NULL,
+              normalized_key TEXT NOT NULL,
+              instruction_text TEXT NOT NULL,
+              learned_by TEXT,
+              created_at_ts BIGINT NOT NULL,
+              PRIMARY KEY (chat_id, normalized_key)
+            )
+            """,
         ]
     else:
         schema_sql = [
@@ -281,6 +293,16 @@ def init_db():
               cached_at_ts INTEGER NOT NULL
             )
             """,
+            """
+            CREATE TABLE IF NOT EXISTS learned_terms (
+              chat_id TEXT NOT NULL,
+              normalized_key TEXT NOT NULL,
+              instruction_text TEXT NOT NULL,
+              learned_by TEXT,
+              created_at_ts INTEGER NOT NULL,
+              PRIMARY KEY (chat_id, normalized_key)
+            )
+            """,
         ]
 
     for stmt in schema_sql:
@@ -311,6 +333,67 @@ def maybe_sweep_retention():
     db_execute("DELETE FROM user_profile_cache WHERE cached_at_ts < :cutoff", {"cutoff": cutoff})
     db_execute("DELETE FROM chat_profile_cache WHERE cached_at_ts < :cutoff", {"cutoff": cutoff})
     _last_retention_sweep = current
+
+
+def normalize_learning_key(text_value: str) -> str:
+    return re.sub(r"\s+", " ", (text_value or "").strip().lower())
+
+
+def parse_learning_instruction(text_value: str) -> str:
+    match = re.match(r"^\s*learn(?:\s+|:\s*)(.+?)\s*$", text_value or "", re.IGNORECASE)
+    if not match:
+        return ""
+    return sanitize_text(match.group(1) or "")
+
+
+def save_learned_term(chat_id: str, instruction_text: str, learned_by: str = ""):
+    normalized_key = normalize_learning_key(instruction_text)
+    if not chat_id or not normalized_key:
+        return
+
+    params = {
+        "chat_id": chat_id,
+        "normalized_key": normalized_key,
+        "instruction_text": instruction_text.strip(),
+        "learned_by": (learned_by or "").strip(),
+        "created_at_ts": now_ts(),
+    }
+    if IS_POSTGRES:
+        db_execute(
+            """
+            INSERT INTO learned_terms(chat_id, normalized_key, instruction_text, learned_by, created_at_ts)
+            VALUES(:chat_id, :normalized_key, :instruction_text, :learned_by, :created_at_ts)
+            ON CONFLICT (chat_id, normalized_key) DO UPDATE
+            SET instruction_text = EXCLUDED.instruction_text,
+                learned_by = EXCLUDED.learned_by,
+                created_at_ts = EXCLUDED.created_at_ts
+            """,
+            params,
+        )
+    else:
+        db_execute(
+            """
+            INSERT OR REPLACE INTO learned_terms(chat_id, normalized_key, instruction_text, learned_by, created_at_ts)
+            VALUES(:chat_id, :normalized_key, :instruction_text, :learned_by, :created_at_ts)
+            """,
+            params,
+        )
+
+
+def load_learned_terms(chat_id: str, limit: int = 40) -> list[str]:
+    if not chat_id:
+        return []
+    rows = db_query_all(
+        """
+        SELECT instruction_text
+        FROM learned_terms
+        WHERE chat_id = :chat_id
+        ORDER BY created_at_ts DESC
+        LIMIT :limit_rows
+        """,
+        {"chat_id": chat_id, "limit_rows": limit},
+    )
+    return [(row.get("instruction_text") or "").strip() for row in rows if (row.get("instruction_text") or "").strip()]
 
 
 def verify_lark_request(raw_body: bytes, payload: dict) -> tuple[bool, str]:
@@ -899,7 +982,7 @@ def load_messages_for_window(chat_id: str, start_ts: int, end_ts: int, root_id: 
     return db_query_all(sql, params)
 
 
-def create_summary(query: str, asker_name: str, language_hint: str, rows: list[dict], window_label: str) -> tuple[str, list[str]]:
+def create_summary(chat_id: str, query: str, asker_name: str, language_hint: str, rows: list[dict], window_label: str) -> tuple[str, list[str]]:
     message_lines = []
     image_pool = []
     speaker_cache: dict[str, str] = {}
@@ -928,6 +1011,7 @@ def create_summary(query: str, asker_name: str, language_hint: str, rows: list[d
         "asker_name": asker_name,
         "window_label": window_label,
         "language_hint": language_hint,
+        "learned_terms": load_learned_terms(chat_id),
         "messages": message_lines,
         "image_pool": image_pool,
     }
@@ -1857,13 +1941,23 @@ def render_owner_reference(chat_id: str, owner_name: str, owner_email: str = "",
     return clean_name
 
 
-def analyze_meeting_with_gemini(request_text: str, minute_url: str, minute_meta: dict, transcript_text: str, media_bytes: bytes | None, media_mime_type: str | None, known_people: list[str]) -> dict:
+def analyze_meeting_with_gemini(
+    request_text: str,
+    minute_url: str,
+    minute_meta: dict,
+    transcript_text: str,
+    media_bytes: bytes | None,
+    media_mime_type: str | None,
+    known_people: list[str],
+    learned_terms: list[str],
+) -> dict:
     user_payload = {
         "request": request_text,
         "minute_url": minute_url,
         "minute_meta": minute_meta,
         "transcript_excerpt": transcript_text,
         "known_people": known_people,
+        "learned_terms": learned_terms,
     }
     parts = [
         types.Part.from_text(text=json.dumps(user_payload, ensure_ascii=False)),
@@ -1924,6 +2018,86 @@ def format_meeting_reply(
     return "\n".join(lines)
 
 
+def parse_meeting_datetime(value, tz_name: str = "UTC") -> datetime | None:
+    if value in (None, ""):
+        return None
+    tz = timezone.utc
+    try:
+        tz = ZoneInfo(tz_name)
+    except Exception:
+        tz = timezone.utc
+
+    if isinstance(value, (int, float)):
+        num = float(value)
+        if num > 1_000_000_000_000:
+            num = num / 1000.0
+        return datetime.fromtimestamp(num, tz=tz)
+
+    if isinstance(value, str):
+        raw = value.strip()
+        if not raw:
+            return None
+        if re.fullmatch(r"\d{10,16}", raw):
+            num = float(raw)
+            if num > 1_000_000_000_000:
+                num = num / 1000.0
+            return datetime.fromtimestamp(num, tz=tz)
+        try:
+            parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=tz)
+            return parsed.astimezone(tz)
+        except Exception:
+            return None
+
+    return None
+
+
+def build_meeting_post_title(minute_meta: dict) -> str:
+    containers = [
+        minute_meta or {},
+        (minute_meta.get("minute") or {}) if isinstance(minute_meta, dict) else {},
+        (minute_meta.get("item") or {}) if isinstance(minute_meta, dict) else {},
+    ]
+
+    base_title = ""
+    tz_name = "UTC"
+    for container in containers:
+        if not isinstance(container, dict):
+            continue
+        if not base_title:
+            base_title = (container.get("title") or "").strip()
+        if tz_name == "UTC":
+            candidate_tz = (container.get("timezone") or container.get("time_zone") or container.get("tz") or "").strip()
+            if candidate_tz:
+                tz_name = candidate_tz
+
+    date_value = None
+    for container in containers:
+        if not isinstance(container, dict):
+            continue
+        for key in ["start_time", "meeting_start_time", "begin_time", "create_time", "created_at", "start_time_ms"]:
+            if container.get(key) not in (None, ""):
+                date_value = container.get(key)
+                break
+        if date_value not in (None, ""):
+            break
+
+    date_label = ""
+    parsed_dt = parse_meeting_datetime(date_value, tz_name=tz_name)
+    if parsed_dt:
+        date_label = f"{parsed_dt.day} {parsed_dt.strftime('%b')}"
+
+    clean_title = sanitize_text(base_title)
+    if clean_title and date_label and f"({date_label})" not in clean_title:
+        return f"{clean_title} ({date_label})"
+    if clean_title:
+        return clean_title
+    if date_label:
+        return f"Meeting ({date_label})"
+    return "Meeting"
+
+
 def build_meeting_reply(chat_id: str, request_text: str, minute_url: str, mode: str) -> tuple[str, str]:
     minute_token = extract_minutes_token(minute_url)
     if not minute_token:
@@ -1972,6 +2146,7 @@ def build_meeting_reply(chat_id: str, request_text: str, minute_url: str, mode: 
         key = normalize_person_name(speaker_name)
         if key and all(normalize_person_name(existing) != key for existing in known_people):
             known_people.append(speaker_name)
+    learned_terms = load_learned_terms(chat_id)
     parsed = analyze_meeting_with_gemini(
         request_text=request_text,
         minute_url=minute_url,
@@ -1980,13 +2155,10 @@ def build_meeting_reply(chat_id: str, request_text: str, minute_url: str, mode: 
         media_bytes=media_bytes,
         media_mime_type=media_mime_type,
         known_people=known_people,
+        learned_terms=learned_terms,
     )
 
-    title = (
-        (minute_meta.get("title") or "").strip()
-        or ((minute_meta.get("minute") or {}).get("title") or "").strip()
-        or ((minute_meta.get("item") or {}).get("title") or "").strip()
-    )
+    title = build_meeting_post_title(minute_meta)
     reply_text = format_meeting_reply(
         chat_id,
         mode,
@@ -2514,6 +2686,37 @@ def webhook():
         if not seg:
             continue
 
+        learning_text = parse_learning_instruction(seg)
+        if learning_text:
+            try:
+                save_learned_term(chat_id, learning_text, sender_name)
+                learned_reply = f"Learned for this chat: {learning_text}"
+                msg_id = send_lark_text_reply(
+                    message_id,
+                    learned_reply,
+                    mention_open_id=sender_open_id,
+                    mention_name=sender_name,
+                )
+                remember_bot_message(msg_id, chat_id)
+                save_bot_text(chat_id, learned_reply, root_id, message_id, event_message_id=msg_id)
+            except Exception:
+                app.logger.exception("Failed to store learned term")
+            continue
+        if re.match(r"^\s*learn\b", seg, re.IGNORECASE):
+            try:
+                prompt_text = 'Tell me what to learn after "Learn".'
+                msg_id = send_lark_text_reply(
+                    message_id,
+                    prompt_text,
+                    mention_open_id=sender_open_id,
+                    mention_name=sender_name,
+                )
+                remember_bot_message(msg_id, chat_id)
+                save_bot_text(chat_id, prompt_text, root_id, message_id, event_message_id=msg_id)
+            except Exception:
+                app.logger.exception("Failed to send learn prompt")
+            continue
+
         meeting_mode = meeting_request_mode(seg)
         if meeting_mode:
             meeting_url = extract_minutes_url(seg) or find_last_meeting_url(chat_id)
@@ -2573,6 +2776,7 @@ def webhook():
 
             try:
                 summary_text, image_keys = create_summary(
+                    chat_id=chat_id,
                     query=seg,
                     asker_name=sender_name,
                     language_hint=infer_language_hint(seg),
@@ -2804,6 +3008,7 @@ def admin_clear_history():
         db_execute("DELETE FROM messages WHERE chat_id = :chat_id", {"chat_id": chat_id})
         db_execute("DELETE FROM bot_messages WHERE chat_id = :chat_id", {"chat_id": chat_id})
         db_execute("DELETE FROM topic_cache WHERE chat_id = :chat_id", {"chat_id": chat_id})
+        db_execute("DELETE FROM learned_terms WHERE chat_id = :chat_id", {"chat_id": chat_id})
         app.logger.warning("Admin cleared history for chat_id=%s", chat_id)
         return jsonify({"ok": True, "scope": "chat", "chat_id": chat_id})
 
@@ -2813,6 +3018,7 @@ def admin_clear_history():
     db_execute("DELETE FROM topic_cache", {})
     db_execute("DELETE FROM user_timezone_cache", {})
     db_execute("DELETE FROM user_profile_cache", {})
+    db_execute("DELETE FROM learned_terms", {})
     app.logger.warning("Admin cleared all history")
     return jsonify({"ok": True, "scope": "all"})
 
