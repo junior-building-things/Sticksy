@@ -8,6 +8,7 @@ import hashlib
 import hmac
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from urllib.parse import quote
 from zoneinfo import ZoneInfo
 
 import requests
@@ -900,22 +901,74 @@ def mention_display_name(mention: dict) -> str:
     )
 
 
+def mention_id_candidates(mention: dict) -> list[tuple[str, str]]:
+    candidates: list[tuple[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+
+    def add(value, id_type: str):
+        if not isinstance(value, str):
+            return
+        clean_value = value.strip()
+        clean_type = (id_type or "").strip().lower() or "open_id"
+        if not clean_value:
+            return
+        item = (clean_value, clean_type)
+        if item in seen:
+            return
+        seen.add(item)
+        candidates.append(item)
+
+    mention_id = mention.get("id") or {}
+    if isinstance(mention_id, dict):
+        add(mention_id.get("open_id"), "open_id")
+        add(mention_id.get("user_id"), "user_id")
+        add(mention_id.get("union_id"), "union_id")
+        raw_id = mention_id.get("id")
+        if isinstance(raw_id, str):
+            add(raw_id, "open_id" if raw_id.strip().startswith("ou_") else "user_id")
+    elif isinstance(mention_id, str):
+        add(mention_id, "open_id" if mention_id.strip().startswith("ou_") else "user_id")
+
+    add(mention.get("open_id"), "open_id")
+    add(mention.get("user_id"), "user_id")
+    add(mention.get("union_id"), "union_id")
+    return candidates
+
+
+def resolve_mention_identity(mention: dict) -> tuple[str, str]:
+    display_name = mention_display_name(mention)
+    for identifier, id_type in mention_id_candidates(mention):
+        identity = fetch_lark_user_identity(identifier, user_id_type=id_type)
+        open_id = (identity.get("open_id") or "").strip()
+        resolved_name = (identity.get("display_name") or "").strip() or display_name
+        if open_id:
+            return open_id, resolved_name
+    return "", display_name
+
+
 def remember_non_bot_mentions(chat_id: str, mentions: list[dict]):
     saved = 0
+    unresolved = 0
     for mention in mentions or []:
         if not isinstance(mention, dict):
             continue
-        open_id = mention_open_id(mention)
-        if not open_id:
-            continue
         display_name = mention_display_name(mention)
         key_value = str(mention.get("key") or "").strip().lower()
+        direct_open_id = mention_open_id(mention)
+        if (LARK_BOT_OPEN_ID and direct_open_id == LARK_BOT_OPEN_ID) or display_name.lower() == "sticksy" or "sticksy" in key_value:
+            continue
+        open_id, resolved_name = resolve_mention_identity(mention)
+        if not open_id:
+            unresolved += 1
+            continue
         if (LARK_BOT_OPEN_ID and open_id == LARK_BOT_OPEN_ID) or display_name.lower() == "sticksy" or "sticksy" in key_value:
             continue
-        save_mentioned_identity(chat_id, open_id, display_name)
+        save_mentioned_identity(chat_id, open_id, resolved_name or display_name)
         saved += 1
     if saved:
         app.logger.info("Saved mentioned identities: chat_id=%s count=%s", chat_id, saved)
+    if unresolved:
+        app.logger.warning("Could not resolve mentioned identities: chat_id=%s count=%s", chat_id, unresolved)
 
 
 def is_bot_mention(mention: dict) -> bool:
@@ -1090,6 +1143,50 @@ def get_user_profile(sender_open_id: str) -> dict:
         )
 
     return {"tz_name": tz_name, "display_name": display_name}
+
+
+def fetch_lark_user_identity(user_id: str, user_id_type: str = "open_id") -> dict:
+    clean_id = (user_id or "").strip()
+    clean_type = (user_id_type or "open_id").strip().lower()
+    if not clean_id:
+        return {"open_id": "", "display_name": ""}
+    if clean_type not in {"open_id", "user_id", "union_id"}:
+        clean_type = "open_id"
+
+    if clean_type == "open_id":
+        profile = get_user_profile(clean_id)
+        return {
+            "open_id": clean_id,
+            "display_name": (profile.get("display_name") or "").strip(),
+        }
+
+    try:
+        resp = requests.get(
+            f"https://open.larkoffice.com/open-apis/contact/v3/users/{quote(clean_id, safe='')}",
+            params={"user_id_type": clean_type},
+            headers=lark_headers(),
+            timeout=HTTP_TIMEOUT,
+        )
+        if resp.status_code >= 400:
+            app.logger.warning("User identity lookup failed type=%s status=%s", clean_type, resp.status_code)
+            return {"open_id": "", "display_name": ""}
+        body = resp.json()
+        if body.get("code", 0) != 0:
+            app.logger.warning(
+                "User identity lookup api error type=%s code=%s msg=%s",
+                clean_type,
+                body.get("code"),
+                body.get("msg"),
+            )
+            return {"open_id": "", "display_name": ""}
+        user = ((body.get("data") or {}).get("user") or {})
+        return {
+            "open_id": (user.get("open_id") or "").strip(),
+            "display_name": ((user.get("name") or user.get("en_name") or "")).strip(),
+        }
+    except Exception:
+        app.logger.exception("User identity lookup exception type=%s", clean_type)
+        return {"open_id": "", "display_name": ""}
 
 
 def get_user_timezone(sender_open_id: str) -> str:
