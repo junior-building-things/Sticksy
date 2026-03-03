@@ -2021,33 +2021,71 @@ def batch_lookup_open_ids_by_email(emails: list[str]) -> dict[str, str]:
     return result
 
 
+def recent_sender_identities(chat_id: str | None = None, limit: int = 300) -> list[dict]:
+    params = {"limit_rows": limit}
+    sql = """
+        SELECT sender_open_id, sender_name, MAX(created_at_ts) AS last_seen_ts
+        FROM messages
+        WHERE sender_open_id IS NOT NULL
+          AND sender_open_id <> ''
+          AND sender_name IS NOT NULL
+          AND sender_name <> ''
+          AND is_from_bot = 0
+    """
+    if chat_id:
+        sql += "\n          AND chat_id = :chat_id"
+        params["chat_id"] = chat_id
+    sql += """
+        GROUP BY sender_open_id, sender_name
+        ORDER BY last_seen_ts DESC
+        LIMIT :limit_rows
+    """
+    return db_query_all(sql, params)
+
+
+def add_known_people_to_index(
+    known_by_normalized_name: dict[str, dict],
+    rows: list[dict],
+    *,
+    require_unique_names: bool = False,
+) -> int:
+    name_counts: dict[str, int] = {}
+    if require_unique_names:
+        for row in rows:
+            key = normalize_person_name((row.get("sender_name") or row.get("display_name") or row.get("name") or "").strip())
+            if key:
+                name_counts[key] = name_counts.get(key, 0) + 1
+
+    added = 0
+    for row in rows:
+        open_id = (row.get("sender_open_id") or row.get("open_id") or "").strip()
+        name = (row.get("sender_name") or row.get("display_name") or row.get("name") or "").strip()
+        if not open_id or not name:
+            continue
+        key = normalize_person_name(name)
+        if not key:
+            continue
+        if require_unique_names and name_counts.get(key, 0) > 1 and key not in known_by_normalized_name:
+            continue
+        if key not in known_by_normalized_name:
+            known_by_normalized_name[key] = {"open_id": open_id, "name": name}
+            added += 1
+
+    return added
+
+
 def enrich_speaker_directory(speaker_directory: list[dict], chat_id: str) -> list[dict]:
     known_by_normalized_name: dict[str, dict] = {}
 
     # Source 1: message history for this chat (most reliable — actual senders)
-    message_senders = db_query_all(
-        """
-        SELECT sender_open_id, sender_name, MAX(created_at_ts) AS last_seen_ts
-        FROM messages
-        WHERE chat_id = :chat_id
-          AND sender_open_id IS NOT NULL AND sender_open_id <> ''
-          AND sender_name IS NOT NULL AND sender_name <> ''
-          AND is_from_bot = 0
-        GROUP BY sender_open_id, sender_name
-        ORDER BY last_seen_ts DESC
-        LIMIT 300
-        """,
-        {"chat_id": chat_id},
-    )
-    for row in message_senders:
-        open_id = (row.get("sender_open_id") or "").strip()
-        name = (row.get("sender_name") or "").strip()
-        if open_id and name:
-            key = normalize_person_name(name)
-            if key and key not in known_by_normalized_name:
-                known_by_normalized_name[key] = {"open_id": open_id, "name": name}
+    message_senders = recent_sender_identities(chat_id, limit=300)
+    add_known_people_to_index(known_by_normalized_name, message_senders)
 
-    # Source 2: cached user profiles (cross-chat — broadens reach)
+    # Source 2: globally seen senders across all tracked chats (only when unambiguous).
+    global_message_senders = recent_sender_identities(limit=600)
+    add_known_people_to_index(known_by_normalized_name, global_message_senders, require_unique_names=True)
+
+    # Source 3: cached user profiles (cross-chat — broadens reach)
     cached_profiles = db_query_all(
         """
         SELECT open_id, display_name
@@ -2057,15 +2095,9 @@ def enrich_speaker_directory(speaker_directory: list[dict], chat_id: str) -> lis
         LIMIT 300
         """,
     )
-    for row in cached_profiles:
-        open_id = (row.get("open_id") or "").strip()
-        name = (row.get("display_name") or "").strip()
-        if open_id and name:
-            key = normalize_person_name(name)
-            if key and key not in known_by_normalized_name:
-                known_by_normalized_name[key] = {"open_id": open_id, "name": name}
+    add_known_people_to_index(known_by_normalized_name, cached_profiles)
 
-    # Source 3: chat member API (may be restricted — bot often only sees itself)
+    # Source 4: chat member API (may be restricted — bot often only sees itself)
     chat_members = fetch_chat_member_directory(chat_id)
     unnamed_resolved = 0
     for member in chat_members:
@@ -2079,13 +2111,14 @@ def enrich_speaker_directory(speaker_directory: list[dict], chat_id: str) -> lis
             member_name = (profile.get("display_name") or "").strip()
         if not member_name:
             continue
-        key = normalize_person_name(member_name)
-        if key and key not in known_by_normalized_name:
-            known_by_normalized_name[key] = {"open_id": member_open_id, "name": member_name}
+        add_known_people_to_index(
+            known_by_normalized_name,
+            [{"open_id": member_open_id, "display_name": member_name}],
+        )
 
     app.logger.warning(
-        "Enrichment: chat_id=%s msg_senders=%s cached_profiles=%s chat_members=%s total_known=%s",
-        chat_id, len(message_senders), len(cached_profiles), len(chat_members), len(known_by_normalized_name),
+        "Enrichment: chat_id=%s msg_senders=%s global_msg_senders=%s cached_profiles=%s chat_members=%s total_known=%s",
+        chat_id, len(message_senders), len(global_message_senders), len(cached_profiles), len(chat_members), len(known_by_normalized_name),
     )
 
     # Step 1: fill open_ids on existing speaker_directory entries via name match
@@ -2141,24 +2174,16 @@ def lookup_owner_open_id(chat_id: str, owner_name: str) -> str:
     if not target:
         return ""
 
-    rows = db_query_all(
-        """
-        SELECT sender_open_id, sender_name
-        FROM messages
-        WHERE chat_id = :chat_id
-          AND sender_open_id IS NOT NULL
-          AND sender_open_id <> ''
-          AND sender_name IS NOT NULL
-          AND sender_name <> ''
-        ORDER BY created_at_ts DESC
-        LIMIT 200
-        """,
-        {"chat_id": chat_id},
-    )
-    for row in rows:
+    for row in recent_sender_identities(chat_id, limit=200):
         sender_name = (row.get("sender_name") or "").strip()
         if person_name_matches(sender_name, target):
             return (row.get("sender_open_id") or "").strip()
+
+    global_known_by_name: dict[str, dict] = {}
+    add_known_people_to_index(global_known_by_name, recent_sender_identities(limit=500), require_unique_names=True)
+    for person in global_known_by_name.values():
+        if person_name_matches(person["name"], target):
+            return person["open_id"]
 
     cached = db_query_all(
         """
