@@ -126,6 +126,10 @@ Rules:
 """.strip()
 
 
+class MeetingTranscriptAccessError(RuntimeError):
+    pass
+
+
 # -------- DB --------
 
 ENGINE = create_engine(
@@ -1504,7 +1508,7 @@ def parse_json_like_blob(blob: str):
     return None
 
 
-def extract_people_directory_from_public_html(page_text: str) -> list[dict]:
+def extract_json_like_blobs_from_html(page_text: str) -> list[str]:
     if not page_text:
         return []
 
@@ -1516,18 +1520,26 @@ def extract_people_directory_from_public_html(page_text: str) -> list[dict]:
         re.compile(r'window\.__INITIAL_STATE__\s*=\s*(\{.*?\})\s*;', re.IGNORECASE | re.DOTALL),
         re.compile(r'window\.__NEXT_DATA__\s*=\s*(\{.*?\})\s*;', re.IGNORECASE | re.DOTALL),
     ]
+
+    seen_blob = set()
     for pattern in script_patterns:
         for match in pattern.finditer(page_text):
             blob = (match.group(1) or "").strip()
-            if blob:
-                blobs.append(blob)
+            if not blob or blob in seen_blob:
+                continue
+            seen_blob.add(blob)
+            blobs.append(blob)
 
-    seen_blob = set()
+    return blobs
+
+
+def extract_people_directory_from_public_html(page_text: str) -> list[dict]:
+    if not page_text:
+        return []
+
+    blobs = extract_json_like_blobs_from_html(page_text)
     collected: list[dict] = []
     for blob in blobs:
-        if blob in seen_blob:
-            continue
-        seen_blob.add(blob)
         parsed = parse_json_like_blob(blob)
         if parsed is None:
             continue
@@ -1543,9 +1555,27 @@ def extract_people_directory_from_public_html(page_text: str) -> list[dict]:
     return extract_people_directory_from_text_blob(page_text)
 
 
-def fetch_public_minute_page_people(minute_url: str) -> list[dict]:
+def extract_transcript_text_from_public_html(page_text: str) -> str:
+    if not page_text:
+        return ""
+
+    best = ""
+    for blob in extract_json_like_blobs_from_html(page_text):
+        parsed = parse_json_like_blob(blob)
+        if parsed is None:
+            continue
+        extracted = extract_transcript_text_from_obj(parsed)
+        if not extracted:
+            continue
+        if len(extracted) > len(best):
+            best = extracted
+
+    return best[:MAX_MEETING_TRANSCRIPT_CHARS] if best else ""
+
+
+def fetch_public_minute_page_text(minute_url: str) -> str:
     if not minute_url:
-        return []
+        return ""
 
     try:
         resp = requests.get(
@@ -1560,22 +1590,32 @@ def fetch_public_minute_page_people(minute_url: str) -> list[dict]:
                 resp.status_code,
                 resp.text[:300],
             )
-            return []
+            return ""
 
         page_text = decode_response_text(resp)
         if not page_text:
             app.logger.warning("Public minute page empty: url=%s", minute_url)
-            return []
-
-        people = extract_people_directory_from_public_html(page_text)
-        if people:
-            app.logger.info("Public minute page people extracted: url=%s count=%s", minute_url, len(people))
-        else:
-            app.logger.warning("Public minute page yielded no people: url=%s", minute_url)
-        return people
+            return ""
+        return page_text
     except Exception:
         app.logger.exception("Failed fetching public minute page: url=%s", minute_url)
+        return ""
+
+
+def fetch_public_minute_page_people(minute_url: str, page_text: str | None = None) -> list[dict]:
+    if not minute_url:
         return []
+
+    resolved_text = page_text or fetch_public_minute_page_text(minute_url)
+    if not resolved_text:
+        return []
+
+    people = extract_people_directory_from_public_html(resolved_text)
+    if people:
+        app.logger.info("Public minute page people extracted: url=%s count=%s", minute_url, len(people))
+    else:
+        app.logger.warning("Public minute page yielded no people: url=%s", minute_url)
+    return people
 
 
 def fetch_lark_minute_media(minute_token: str) -> tuple[bytes, str] | tuple[None, None]:
@@ -1986,13 +2026,14 @@ def enrich_speaker_directory(speaker_directory: list[dict], chat_id: str) -> lis
     # Source 1: message history for this chat (most reliable — actual senders)
     message_senders = db_query_all(
         """
-        SELECT DISTINCT sender_open_id, sender_name
+        SELECT sender_open_id, sender_name, MAX(created_at_ts) AS last_seen_ts
         FROM messages
         WHERE chat_id = :chat_id
           AND sender_open_id IS NOT NULL AND sender_open_id <> ''
           AND sender_name IS NOT NULL AND sender_name <> ''
           AND is_from_bot = 0
-        ORDER BY created_at_ts DESC
+        GROUP BY sender_open_id, sender_name
+        ORDER BY last_seen_ts DESC
         LIMIT 300
         """,
         {"chat_id": chat_id},
@@ -2487,6 +2528,17 @@ def build_meeting_reply(chat_id: str, request_text: str, minute_url: str, mode: 
     transcript_text, transcript_data = fetch_lark_minute_transcript(minute_token)
     if not transcript_text and minute_meta:
         transcript_text = extract_transcript_text_from_obj(minute_meta)
+    public_page_text = ""
+    if not transcript_text:
+        public_page_text = fetch_public_minute_page_text(minute_url)
+        if public_page_text:
+            transcript_text = extract_transcript_text_from_public_html(public_page_text)
+            if transcript_text:
+                app.logger.info(
+                    "Minutes transcript extracted from public page length=%s token=%s",
+                    len(transcript_text),
+                    minute_token,
+                )
     media_bytes = None
     media_mime_type = None
 
@@ -2494,7 +2546,7 @@ def build_meeting_reply(chat_id: str, request_text: str, minute_url: str, mode: 
         media_bytes, media_mime_type = fetch_lark_minute_media(minute_token)
 
     if not transcript_text and not media_bytes:
-        raise RuntimeError("meeting transcript is not accessible yet")
+        raise MeetingTranscriptAccessError("meeting transcript is not accessible yet")
 
     # --- Build speaker directory from meeting data sources ---
     # Source 1: speaker emails from transcript text
@@ -2502,7 +2554,7 @@ def build_meeting_reply(chat_id: str, request_text: str, minute_url: str, mode: 
     # Source 2: participant info from statistics API
     participant_directory = extract_participant_directory_from_obj(fetch_lark_minute_statistics(minute_token))
     if not participant_directory:
-        participant_directory = fetch_public_minute_page_people(minute_url)
+        participant_directory = fetch_public_minute_page_people(minute_url, page_text=public_page_text or None)
     # Source 3: participant info from transcript JSON and minute metadata
     meta_participants = extract_participant_directory_from_obj(minute_meta) if minute_meta else []
     transcript_participants = extract_participant_directory_from_obj(transcript_data) if transcript_data else []
@@ -3160,10 +3212,25 @@ def webhook():
                 )
                 remember_bot_message(msg_id, chat_id)
                 save_bot_text(chat_id, meeting_reply, root_id, message_id, event_message_id=msg_id)
+            except MeetingTranscriptAccessError:
+                app.logger.warning("Meeting transcript unavailable for url=%s", meeting_url)
+                try:
+                    unavailable_text = "I couldn't access that meeting transcript yet."
+                    msg_id = send_lark_text_reply(
+                        message_id,
+                        unavailable_text,
+                        mention_open_id=sender_open_id,
+                        mention_name=sender_name,
+                    )
+                    remember_bot_message(msg_id, chat_id)
+                    save_bot_text(chat_id, unavailable_text, root_id, message_id, event_message_id=msg_id)
+                except Exception:
+                    app.logger.exception("Failed to send meeting-unavailable reply")
+                continue
             except Exception:
                 app.logger.exception("Meeting summary/send failed")
                 try:
-                    unavailable_text = "I couldn't access that meeting transcript yet."
+                    unavailable_text = "I couldn't summarize that meeting just now."
                     msg_id = send_lark_text_reply(
                         message_id,
                         unavailable_text,
