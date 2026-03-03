@@ -1333,17 +1333,20 @@ def extract_participant_directory_from_obj(obj, allow_name_only: bool = False) -
     out: list[dict] = []
     seen: set[tuple[str, str, str]] = set()
 
-    name_keys = {"speaker", "speaker_name", "name", "user_name", "display_name", "participant_name", "attendee_name"}
+    name_keys = {
+        "speaker", "speaker_name", "name", "user_name", "display_name",
+        "participant_name", "attendee_name", "nick_name", "nickname", "full_name", "en_name",
+    }
     email_keys = {"email", "speaker_email", "user_email", "email_address"}
     participant_hints = ("participant", "attendee", "speaker", "member", "people", "user", "owner", "invitee")
 
-    def maybe_add(node, parent_key: str = ""):
+    def maybe_add(node, parent_key: str = "", context_hint: bool = False):
         if not isinstance(node, dict):
             return
 
-        participant_name = sanitize_text(first_nested_string(node, name_keys, max_depth=1))
-        participant_email = first_nested_string(node, email_keys, max_depth=1).lower()
-        participant_open_id = first_nested_id(node, max_depth=1)
+        participant_name = sanitize_text(first_nested_string(node, name_keys, max_depth=2))
+        participant_email = first_nested_string(node, email_keys, max_depth=2).lower()
+        participant_open_id = first_nested_id(node, max_depth=2)
 
         if not participant_name:
             return
@@ -1352,7 +1355,7 @@ def extract_participant_directory_from_obj(obj, allow_name_only: bool = False) -
                 return
             parent_hint = (parent_key or "").lower()
             node_keys = {str(k).lower() for k in node.keys()}
-            has_context_hint = any(hint in parent_hint for hint in participant_hints)
+            has_context_hint = context_hint or any(hint in parent_hint for hint in participant_hints)
             has_node_hint = any(hint in key for key in node_keys for hint in participant_hints)
             has_explicit_name_hint = bool(node_keys & {"participant_name", "attendee_name", "speaker_name", "user_name", "display_name"})
             if not (has_context_hint or has_node_hint or has_explicit_name_hint):
@@ -1369,14 +1372,18 @@ def extract_participant_directory_from_obj(obj, allow_name_only: bool = False) -
                 }
             )
 
-    def walk(node, parent_key: str = ""):
+    def walk(node, parent_key: str = "", context_hint: bool = False):
         if isinstance(node, dict):
-            maybe_add(node, parent_key=parent_key)
+            node_keys = {str(k).lower() for k in node.keys()}
+            node_hint = context_hint or any(hint in key for key in node_keys for hint in participant_hints)
+            maybe_add(node, parent_key=parent_key, context_hint=node_hint)
             for key, value in node.items():
-                walk(value, parent_key=str(key).lower())
+                child_key = str(key).lower()
+                child_hint = node_hint or any(hint in child_key for hint in participant_hints)
+                walk(value, parent_key=child_key, context_hint=child_hint)
         elif isinstance(node, list):
             for item in node:
-                walk(item, parent_key=parent_key)
+                walk(item, parent_key=parent_key, context_hint=context_hint)
 
     walk(obj)
     return out
@@ -1555,7 +1562,7 @@ def extract_people_directory_from_public_html(page_text: str) -> list[dict]:
             continue
         collected = merge_people_directories(
             collected,
-            extract_participant_directory_from_obj(parsed),
+            extract_participant_directory_from_obj(parsed, allow_name_only=True),
             extract_speaker_directory_from_obj(parsed),
         )
 
