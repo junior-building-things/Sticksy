@@ -1312,7 +1312,30 @@ def meeting_request_mode(text: str) -> str:
     return ""
 
 
-def find_last_meeting_url(chat_id: str, limit: int = 80) -> str:
+def prefers_requester_owned_recent_meeting(text: str) -> bool:
+    lowered = (text or "").lower()
+    explicit_phrases = [
+        "my previous meeting",
+        "my last meeting",
+        "my latest meeting",
+        "my recent meeting",
+        "meeting i owned",
+        "meeting i was the owner of",
+        "meeting i hosted",
+        "meeting i organized",
+        "meeting i organised",
+        "meeting i led",
+    ]
+    implicit_recent_phrases = [
+        "previous meeting",
+        "last meeting",
+        "latest meeting",
+        "recent meeting",
+    ]
+    return any(phrase in lowered for phrase in explicit_phrases + implicit_recent_phrases)
+
+
+def recent_meeting_urls(chat_id: str, scan_limit: int = 80, unique_limit: int = 12) -> list[str]:
     rows = db_query_all(
         """
         SELECT text_content
@@ -1323,13 +1346,25 @@ def find_last_meeting_url(chat_id: str, limit: int = 80) -> str:
         ORDER BY created_at_ts DESC
         LIMIT :limit_rows
         """,
-        {"chat_id": chat_id, "limit_rows": limit},
+        {"chat_id": chat_id, "limit_rows": scan_limit},
     )
+
+    urls: list[str] = []
+    seen: set[str] = set()
     for row in rows:
         url = extract_minutes_url(row.get("text_content") or "")
-        if url:
-            return url
-    return ""
+        if not url or url in seen:
+            continue
+        seen.add(url)
+        urls.append(url)
+        if len(urls) >= unique_limit:
+            break
+    return urls
+
+
+def find_last_meeting_url(chat_id: str, limit: int = 80) -> str:
+    urls = recent_meeting_urls(chat_id, scan_limit=limit, unique_limit=1)
+    return urls[0] if urls else ""
 
 
 def lark_auth_headers() -> dict:
@@ -2994,6 +3029,177 @@ def build_meeting_post_title(minute_meta: dict) -> str:
     return "Meeting"
 
 
+def extract_meeting_owner_candidates(minute_meta: dict) -> list[dict]:
+    if not isinstance(minute_meta, dict):
+        return []
+
+    out: list[dict] = []
+    seen: set[tuple[str, str]] = set()
+    resolved_ids: dict[tuple[str, str], dict] = {}
+    owner_hints = ("owner", "host", "organizer", "organiser", "creator")
+    name_keys = {
+        "owner_name", "host_name", "organizer_name", "organiser_name", "creator_name",
+        "name", "user_name", "display_name", "full_name", "en_name", "nick_name", "nickname",
+    }
+
+    def collect_id_candidates(node, max_depth: int = 2) -> list[tuple[str, str]]:
+        candidates: list[tuple[str, str]] = []
+        local_seen: set[tuple[str, str]] = set()
+
+        def maybe_add(identifier, id_type: str):
+            if not isinstance(identifier, str):
+                return
+            clean_id = identifier.strip()
+            if not clean_id:
+                return
+            key = (clean_id, id_type)
+            if key in local_seen:
+                return
+            local_seen.add(key)
+            candidates.append(key)
+
+        def walk(value, depth: int):
+            if depth < 0:
+                return
+            if isinstance(value, dict):
+                member_id = value.get("member_id")
+                if isinstance(member_id, dict):
+                    maybe_add(member_id.get("open_id"), "open_id")
+                    maybe_add(member_id.get("user_id"), "user_id")
+                    maybe_add(member_id.get("union_id"), "union_id")
+                    maybe_add(member_id.get("id"), "open_id")
+                elif isinstance(member_id, str):
+                    maybe_add(member_id, "open_id")
+
+                for key, item in value.items():
+                    key_l = str(key).lower()
+                    if key_l == "open_id":
+                        maybe_add(item, "open_id")
+                    elif key_l in {"user_id", "owner_user_id", "host_user_id", "creator_user_id"}:
+                        maybe_add(item, "user_id")
+                    elif key_l == "union_id":
+                        maybe_add(item, "union_id")
+                    elif key_l in {"id", "owner_id", "host_id", "creator_id"}:
+                        maybe_add(item, "open_id")
+
+                if depth > 0:
+                    for item in value.values():
+                        walk(item, depth - 1)
+            elif isinstance(value, list) and depth > 0:
+                for item in value:
+                    walk(item, depth - 1)
+
+        walk(node, max_depth)
+        return candidates
+
+    def maybe_add(node, parent_key: str = "", context_hint: bool = False):
+        if not isinstance(node, dict):
+            return
+
+        parent_hint = (parent_key or "").lower()
+        node_keys = {str(k).lower() for k in node.keys()}
+        has_context = context_hint or any(hint in parent_hint for hint in owner_hints) or any(
+            hint in key for key in node_keys for hint in owner_hints
+        )
+        if not has_context:
+            return
+
+        owner_name = sanitize_text(first_nested_string(node, name_keys, max_depth=2))
+        owner_open_id = ""
+        for identifier, id_type in collect_id_candidates(node, max_depth=2):
+            cache_key = (identifier, id_type)
+            if cache_key not in resolved_ids:
+                resolved_ids[cache_key] = fetch_lark_user_identity(identifier, id_type)
+            identity = resolved_ids[cache_key]
+            if not owner_open_id and (identity.get("open_id") or "").strip():
+                owner_open_id = (identity.get("open_id") or "").strip()
+            if not owner_name and (identity.get("display_name") or "").strip():
+                owner_name = (identity.get("display_name") or "").strip()
+            if owner_open_id and owner_name:
+                break
+
+        normalized_name = normalize_person_name(owner_name)
+        item_key = (owner_open_id, normalized_name)
+        if item_key in seen:
+            return
+        if not owner_open_id and not normalized_name:
+            return
+        seen.add(item_key)
+        out.append({"name": owner_name, "open_id": owner_open_id})
+
+    def walk(node, parent_key: str = "", context_hint: bool = False):
+        if isinstance(node, dict):
+            node_keys = {str(k).lower() for k in node.keys()}
+            node_hint = context_hint or any(hint in key for key in node_keys for hint in owner_hints)
+            maybe_add(node, parent_key=parent_key, context_hint=node_hint)
+            for key, value in node.items():
+                child_key = str(key).lower()
+                child_hint = node_hint or any(hint in child_key for hint in owner_hints)
+                walk(value, parent_key=child_key, context_hint=child_hint)
+        elif isinstance(node, list):
+            for item in node:
+                walk(item, parent_key=parent_key, context_hint=context_hint)
+
+    walk(minute_meta)
+    return out
+
+
+def minute_owned_by_requester(minute_meta: dict, requester_open_id: str, requester_name: str) -> bool:
+    clean_requester_id = (requester_open_id or "").strip()
+    clean_requester_name = sanitize_text(requester_name or "")
+    for candidate in extract_meeting_owner_candidates(minute_meta):
+        owner_open_id = (candidate.get("open_id") or "").strip()
+        owner_name = (candidate.get("name") or "").strip()
+        if clean_requester_id and owner_open_id and owner_open_id == clean_requester_id:
+            return True
+        if clean_requester_name and owner_name and person_name_matches(owner_name, clean_requester_name):
+            return True
+    return False
+
+
+def find_last_requester_owned_meeting_url(
+    chat_id: str,
+    requester_open_id: str,
+    requester_name: str,
+    scan_limit: int = 160,
+    candidate_limit: int = 12,
+) -> str:
+    if not requester_open_id and not (requester_name or "").strip():
+        return ""
+
+    for meeting_url in recent_meeting_urls(chat_id, scan_limit=scan_limit, unique_limit=candidate_limit):
+        minute_token = extract_minutes_token(meeting_url)
+        if not minute_token:
+            continue
+        try:
+            minute_meta = fetch_lark_minute_meta(minute_token)
+        except Exception:
+            app.logger.warning("Requester-owned meeting lookup skipped meta fetch: token=%s", minute_token)
+            continue
+        if minute_owned_by_requester(minute_meta, requester_open_id, requester_name):
+            app.logger.info(
+                "Requester-owned meeting selected: chat_id=%s token=%s requester=%s",
+                chat_id,
+                minute_token,
+                requester_name,
+            )
+            return meeting_url
+    return ""
+
+
+def choose_meeting_url_for_request(chat_id: str, request_text: str, requester_open_id: str, requester_name: str) -> str:
+    direct_url = extract_minutes_url(request_text)
+    if direct_url:
+        return direct_url
+
+    if prefers_requester_owned_recent_meeting(request_text):
+        owned_url = find_last_requester_owned_meeting_url(chat_id, requester_open_id, requester_name)
+        if owned_url:
+            return owned_url
+
+    return find_last_meeting_url(chat_id)
+
+
 def build_meeting_reply(chat_id: str, request_text: str, minute_url: str, mode: str) -> tuple[str, str]:
     minute_token = extract_minutes_token(minute_url)
     if not minute_token:
@@ -3708,7 +3914,7 @@ def webhook():
 
         meeting_mode = meeting_request_mode(seg)
         if meeting_mode:
-            meeting_url = extract_minutes_url(seg) or find_last_meeting_url(chat_id)
+            meeting_url = choose_meeting_url_for_request(chat_id, seg, sender_open_id, sender_name)
             if not meeting_url:
                 try:
                     missing_meeting = "I couldn't find a recent meeting transcript link in this chat yet."
