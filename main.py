@@ -236,6 +236,17 @@ def init_db():
               PRIMARY KEY (chat_id, normalized_key)
             )
             """,
+            """
+            CREATE TABLE IF NOT EXISTS mentioned_identities (
+              chat_id TEXT NOT NULL,
+              normalized_name TEXT NOT NULL,
+              open_id TEXT NOT NULL,
+              display_name TEXT NOT NULL,
+              created_at_ts BIGINT NOT NULL,
+              PRIMARY KEY (chat_id, normalized_name, open_id)
+            )
+            """,
+            "CREATE INDEX IF NOT EXISTS idx_mentioned_identities_chat_time ON mentioned_identities(chat_id, created_at_ts DESC)",
         ]
     else:
         schema_sql = [
@@ -310,6 +321,17 @@ def init_db():
               PRIMARY KEY (chat_id, normalized_key)
             )
             """,
+            """
+            CREATE TABLE IF NOT EXISTS mentioned_identities (
+              chat_id TEXT NOT NULL,
+              normalized_name TEXT NOT NULL,
+              open_id TEXT NOT NULL,
+              display_name TEXT NOT NULL,
+              created_at_ts INTEGER NOT NULL,
+              PRIMARY KEY (chat_id, normalized_name, open_id)
+            )
+            """,
+            "CREATE INDEX IF NOT EXISTS idx_mentioned_identities_chat_time ON mentioned_identities(chat_id, created_at_ts DESC)",
         ]
 
     for stmt in schema_sql:
@@ -399,6 +421,69 @@ def load_learned_terms(chat_id: str, limit: int = 40) -> list[str]:
         {"chat_id": GLOBAL_LEARN_SCOPE, "limit_rows": limit},
     )
     return [(row.get("instruction_text") or "").strip() for row in rows if (row.get("instruction_text") or "").strip()]
+
+
+def save_mentioned_identity(chat_id: str, open_id: str, display_name: str):
+    clean_chat_id = (chat_id or "").strip()
+    clean_open_id = (open_id or "").strip()
+    clean_name = (display_name or "").strip()
+    normalized_name = normalize_person_name(clean_name)
+    if not clean_chat_id or not clean_open_id or not clean_name or not normalized_name:
+        return
+
+    params = {
+        "chat_id": clean_chat_id,
+        "normalized_name": normalized_name,
+        "open_id": clean_open_id,
+        "display_name": clean_name,
+        "created_at_ts": now_ts(),
+    }
+    if IS_POSTGRES:
+        db_execute(
+            """
+            INSERT INTO mentioned_identities(chat_id, normalized_name, open_id, display_name, created_at_ts)
+            VALUES(:chat_id, :normalized_name, :open_id, :display_name, :created_at_ts)
+            ON CONFLICT (chat_id, normalized_name, open_id) DO UPDATE
+            SET display_name = EXCLUDED.display_name,
+                created_at_ts = EXCLUDED.created_at_ts
+            """,
+            params,
+        )
+    else:
+        db_execute(
+            """
+            INSERT OR REPLACE INTO mentioned_identities(chat_id, normalized_name, open_id, display_name, created_at_ts)
+            VALUES(:chat_id, :normalized_name, :open_id, :display_name, :created_at_ts)
+            """,
+            params,
+        )
+
+
+def recent_mentioned_identities(chat_id: str | None = None, limit: int = 300) -> list[dict]:
+    params = {"limit_rows": limit}
+    if chat_id:
+        return db_query_all(
+            """
+            SELECT open_id, display_name, MAX(created_at_ts) AS last_seen_ts
+            FROM mentioned_identities
+            WHERE chat_id = :chat_id
+            GROUP BY open_id, display_name
+            ORDER BY last_seen_ts DESC
+            LIMIT :limit_rows
+            """,
+            {"chat_id": chat_id, "limit_rows": limit},
+        )
+
+    return db_query_all(
+        """
+        SELECT open_id, display_name, MAX(created_at_ts) AS last_seen_ts
+        FROM mentioned_identities
+        GROUP BY open_id, display_name
+        ORDER BY last_seen_ts DESC
+        LIMIT :limit_rows
+        """,
+        params,
+    )
 
 
 def verify_lark_request(raw_body: bytes, payload: dict) -> tuple[bool, str]:
@@ -796,7 +881,41 @@ def extract_text_content(message_type: str, content_obj: dict) -> str:
 
 
 def mention_open_id(mention: dict) -> str:
-    return ((mention.get("id") or {}).get("open_id")) or ""
+    mention_id = mention.get("id") or {}
+    if isinstance(mention_id, dict):
+        return (
+            (mention_id.get("open_id") or "").strip()
+            or (mention.get("open_id") or "").strip()
+        )
+    if isinstance(mention_id, str):
+        return mention_id.strip() or (mention.get("open_id") or "").strip()
+    return (mention.get("open_id") or "").strip()
+
+
+def mention_display_name(mention: dict) -> str:
+    return sanitize_text(
+        (mention.get("name") or "").strip()
+        or (mention.get("user_name") or "").strip()
+        or (mention.get("display_name") or "").strip()
+    )
+
+
+def remember_non_bot_mentions(chat_id: str, mentions: list[dict]):
+    saved = 0
+    for mention in mentions or []:
+        if not isinstance(mention, dict):
+            continue
+        open_id = mention_open_id(mention)
+        if not open_id:
+            continue
+        display_name = mention_display_name(mention)
+        key_value = str(mention.get("key") or "").strip().lower()
+        if (LARK_BOT_OPEN_ID and open_id == LARK_BOT_OPEN_ID) or display_name.lower() == "sticksy" or "sticksy" in key_value:
+            continue
+        save_mentioned_identity(chat_id, open_id, display_name)
+        saved += 1
+    if saved:
+        app.logger.info("Saved mentioned identities: chat_id=%s count=%s", chat_id, saved)
 
 
 def is_bot_mention(mention: dict) -> bool:
@@ -804,7 +923,7 @@ def is_bot_mention(mention: dict) -> bool:
     if LARK_BOT_OPEN_ID:
         if open_id == LARK_BOT_OPEN_ID:
             return True
-        name = str(mention.get("name") or "").strip().lower()
+        name = mention_display_name(mention).lower()
         if name == "sticksy":
             return True
         key = str(mention.get("key") or "").strip().lower()
@@ -2170,11 +2289,19 @@ def enrich_speaker_directory(speaker_directory: list[dict], chat_id: str) -> lis
     message_senders = recent_sender_identities(chat_id, limit=300)
     add_known_people_to_index(known_by_normalized_name, message_senders)
 
-    # Source 2: globally seen senders across all tracked chats (only when unambiguous).
+    # Source 2: identities learned from user mentions in this chat.
+    mentioned_in_chat = recent_mentioned_identities(chat_id, limit=300)
+    add_known_people_to_index(known_by_normalized_name, mentioned_in_chat)
+
+    # Source 3: globally seen senders across all tracked chats (only when unambiguous).
     global_message_senders = recent_sender_identities(limit=600)
     add_known_people_to_index(known_by_normalized_name, global_message_senders, require_unique_names=True)
 
-    # Source 3: cached user profiles (cross-chat — broadens reach)
+    # Source 4: identities learned from mentions across all chats (only when unambiguous).
+    global_mentions = recent_mentioned_identities(limit=600)
+    add_known_people_to_index(known_by_normalized_name, global_mentions, require_unique_names=True)
+
+    # Source 5: cached user profiles (cross-chat — broadens reach)
     cached_profiles = db_query_all(
         """
         SELECT open_id, display_name
@@ -2186,7 +2313,7 @@ def enrich_speaker_directory(speaker_directory: list[dict], chat_id: str) -> lis
     )
     add_known_people_to_index(known_by_normalized_name, cached_profiles)
 
-    # Source 4: chat member API (may be restricted — bot often only sees itself)
+    # Source 6: chat member API (may be restricted — bot often only sees itself)
     chat_members = fetch_chat_member_directory(chat_id)
     unnamed_resolved = 0
     for member in chat_members:
@@ -2206,8 +2333,15 @@ def enrich_speaker_directory(speaker_directory: list[dict], chat_id: str) -> lis
         )
 
     app.logger.warning(
-        "Enrichment: chat_id=%s msg_senders=%s global_msg_senders=%s cached_profiles=%s chat_members=%s total_known=%s",
-        chat_id, len(message_senders), len(global_message_senders), len(cached_profiles), len(chat_members), len(known_by_normalized_name),
+        "Enrichment: chat_id=%s msg_senders=%s chat_mentions=%s global_msg_senders=%s global_mentions=%s cached_profiles=%s chat_members=%s total_known=%s",
+        chat_id,
+        len(message_senders),
+        len(mentioned_in_chat),
+        len(global_message_senders),
+        len(global_mentions),
+        len(cached_profiles),
+        len(chat_members),
+        len(known_by_normalized_name),
     )
 
     # Step 1: fill open_ids on existing speaker_directory entries via name match
@@ -2268,9 +2402,20 @@ def lookup_owner_open_id(chat_id: str, owner_name: str) -> str:
         if person_name_matches(sender_name, target):
             return (row.get("sender_open_id") or "").strip()
 
+    for row in recent_mentioned_identities(chat_id, limit=200):
+        display_name = (row.get("display_name") or "").strip()
+        if person_name_matches(display_name, target):
+            return (row.get("open_id") or "").strip()
+
     global_known_by_name: dict[str, dict] = {}
     add_known_people_to_index(global_known_by_name, recent_sender_identities(limit=500), require_unique_names=True)
     for person in global_known_by_name.values():
+        if person_name_matches(person["name"], target):
+            return person["open_id"]
+
+    global_mentions_by_name: dict[str, dict] = {}
+    add_known_people_to_index(global_mentions_by_name, recent_mentioned_identities(limit=500), require_unique_names=True)
+    for person in global_mentions_by_name.values():
         if person_name_matches(person["name"], target):
             return person["open_id"]
 
@@ -3378,6 +3523,9 @@ def webhook():
     msg_type = message.get("message_type") or ""
     text_content = extract_text_content(msg_type, content_obj)
     image_key = (content_obj.get("image_key") or "") if msg_type == "image" else ""
+    mentions = message.get("mentions") or content_obj.get("mentions") or []
+    if not isinstance(mentions, list):
+        mentions = []
 
     create_time = int(message.get("create_time") or int(time.time() * 1000))
     created_at_ts = int(create_time / 1000)
@@ -3410,6 +3558,8 @@ def webhook():
             parent_id=parent_id,
             created_at_ts=created_at_ts,
         )
+
+    remember_non_bot_mentions(chat_id, mentions)
 
     should, segments = should_respond(message, content_obj, text_content)
     if not should:
@@ -3764,6 +3914,7 @@ def admin_clear_history():
         db_execute("DELETE FROM bot_messages WHERE chat_id = :chat_id", {"chat_id": chat_id})
         db_execute("DELETE FROM topic_cache WHERE chat_id = :chat_id", {"chat_id": chat_id})
         db_execute("DELETE FROM learned_terms WHERE chat_id = :chat_id", {"chat_id": chat_id})
+        db_execute("DELETE FROM mentioned_identities WHERE chat_id = :chat_id", {"chat_id": chat_id})
         app.logger.warning("Admin cleared history for chat_id=%s", chat_id)
         return jsonify({"ok": True, "scope": "chat", "chat_id": chat_id})
 
@@ -3774,6 +3925,7 @@ def admin_clear_history():
     db_execute("DELETE FROM user_timezone_cache", {})
     db_execute("DELETE FROM user_profile_cache", {})
     db_execute("DELETE FROM learned_terms", {})
+    db_execute("DELETE FROM mentioned_identities", {})
     app.logger.warning("Admin cleared all history")
     return jsonify({"ok": True, "scope": "all"})
 
