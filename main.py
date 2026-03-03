@@ -1488,6 +1488,79 @@ def extract_people_directory_from_text_blob(blob: str) -> list[dict]:
     return out
 
 
+def extract_name_like_values_from_obj(obj, limit: int = 30) -> list[str]:
+    if obj is None:
+        return []
+
+    name_keys = {
+        "speaker", "speaker_name", "name", "user_name", "display_name",
+        "participant_name", "attendee_name", "nick_name", "nickname", "full_name", "en_name",
+    }
+    out: list[str] = []
+    seen: set[str] = set()
+
+    def maybe_add(value):
+        if not isinstance(value, str):
+            return
+        cleaned = sanitize_text(value)
+        if not cleaned:
+            return
+        if cleaned.startswith(("http://", "https://")):
+            return
+        if len(cleaned) > 80:
+            return
+        if not re.search(r"[A-Za-z\u4e00-\u9fff]", cleaned):
+            return
+        key = normalize_person_name(cleaned)
+        if not key or key in seen:
+            return
+        seen.add(key)
+        out.append(cleaned)
+
+    def walk(node):
+        if len(out) >= limit:
+            return
+        if isinstance(node, dict):
+            for key, value in node.items():
+                key_l = str(key).lower()
+                if key_l in name_keys:
+                    maybe_add(value)
+                    if len(out) >= limit:
+                        return
+                walk(value)
+                if len(out) >= limit:
+                    return
+        elif isinstance(node, list):
+            for item in node:
+                walk(item)
+                if len(out) >= limit:
+                    return
+
+    walk(obj)
+    return out
+
+
+def extract_name_like_values_from_public_html(page_text: str, limit: int = 30) -> list[str]:
+    if not page_text:
+        return []
+
+    out: list[str] = []
+    seen: set[str] = set()
+    for blob in extract_json_like_blobs_from_html(page_text):
+        parsed = parse_json_like_blob(blob)
+        if parsed is None:
+            continue
+        for name in extract_name_like_values_from_obj(parsed, limit=limit):
+            key = normalize_person_name(name)
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            out.append(name)
+            if len(out) >= limit:
+                return out
+    return out
+
+
 def parse_json_like_blob(blob: str):
     if not blob:
         return None
@@ -2694,12 +2767,45 @@ def build_meeting_reply(chat_id: str, request_text: str, minute_url: str, mode: 
     # Source 1: speaker emails from transcript text
     transcript_directory = extract_transcript_speaker_emails(transcript_text)
     # Source 2: participant info from statistics API
-    participant_directory = extract_participant_directory_from_obj(fetch_lark_minute_statistics(minute_token), allow_name_only=True)
+    statistics_data = fetch_lark_minute_statistics(minute_token)
+    participant_directory = extract_participant_directory_from_obj(statistics_data, allow_name_only=True)
     if not participant_directory:
         participant_directory = fetch_public_minute_page_people(minute_url, page_text=public_page_text or None)
     # Source 3: participant info from transcript JSON and minute metadata
     meta_participants = extract_participant_directory_from_obj(minute_meta, allow_name_only=True) if minute_meta else []
     transcript_participants = extract_participant_directory_from_obj(transcript_data, allow_name_only=True) if transcript_data else []
+    if not participant_directory and not meta_participants and not transcript_participants:
+        fallback_names = []
+        for source_names in [
+            extract_name_like_values_from_obj(statistics_data, limit=20),
+            extract_name_like_values_from_obj(minute_meta, limit=20) if minute_meta else [],
+            extract_name_like_values_from_obj(transcript_data, limit=20) if transcript_data else [],
+            extract_name_like_values_from_public_html(public_page_text, limit=20) if public_page_text else [],
+        ]:
+            for name in source_names:
+                key = normalize_person_name(name)
+                if not key:
+                    continue
+                if any(normalize_person_name(existing.get("name") or "") == key for existing in fallback_names):
+                    continue
+                fallback_names.append({"name": name, "email": "", "open_id": ""})
+        if fallback_names:
+            participant_directory = fallback_names
+            app.logger.warning(
+                "Meeting participant name fallback used: token=%s count=%s samples=%s",
+                minute_token,
+                len(fallback_names),
+                [item["name"] for item in fallback_names[:8]],
+            )
+        else:
+            app.logger.warning(
+                "Meeting participant extraction empty: token=%s stats_name_samples=%s meta_name_samples=%s transcript_name_samples=%s public_name_samples=%s",
+                minute_token,
+                extract_name_like_values_from_obj(statistics_data, limit=8),
+                extract_name_like_values_from_obj(minute_meta, limit=8) if minute_meta else [],
+                extract_name_like_values_from_obj(transcript_data, limit=8) if transcript_data else [],
+                extract_name_like_values_from_public_html(public_page_text, limit=8) if public_page_text else [],
+            )
 
     speaker_directory = merge_people_directories(
         participant_directory, transcript_directory, meta_participants, transcript_participants,
@@ -2727,7 +2833,7 @@ def build_meeting_reply(chat_id: str, request_text: str, minute_url: str, mode: 
             resolved_from_meeting += 1
 
     app.logger.warning(
-        "Meeting speaker directory: token=%s text_emails=%s stats_participants=%s meta=%s transcript_json=%s meeting_ids=%s resolved=%s total=%s",
+        "Meeting speaker directory: token=%s text_people=%s stats_participants=%s meta=%s transcript_json=%s meeting_ids=%s resolved=%s total=%s",
         minute_token,
         len(transcript_directory),
         len(participant_directory),
