@@ -115,6 +115,7 @@ Rules:
 - Preserve the language of the user's request.
 - Use the meeting transcript or meeting media as the source of truth.
 - Prefer owner names that exactly match the provided known participant names when applicable.
+- When an owner matches a provided owner candidate, copy the owner name exactly from owner_candidates.
 - Never translate, localize, or romanize people's names. Preserve person names exactly as they appear in the transcript or known_people.
 - If the transcript includes a speaker email, include it in owner_email.
 - Use any provided learned terminology exactly when relevant.
@@ -2324,6 +2325,104 @@ def infer_owner_open_id_from_directory(owner_name: str, owner_email: str, speake
     return exact_match_open_id or fuzzy_match_open_id
 
 
+def build_owner_candidates(speaker_directory: list[dict] | None, known_people: list[str] | None = None) -> list[dict]:
+    candidates: list[dict] = []
+    seen: set[tuple[str, str]] = set()
+
+    for item in speaker_directory or []:
+        name = (item.get("name") or "").strip()
+        email = (item.get("email") or "").strip().lower()
+        key = (normalize_person_name(name), email)
+        if not key[0] or key in seen:
+            continue
+        seen.add(key)
+        candidates.append({"name": name, "email": email})
+
+    for name in known_people or []:
+        clean_name = (name or "").strip()
+        key = (normalize_person_name(clean_name), "")
+        if not key[0] or key in seen:
+            continue
+        seen.add(key)
+        candidates.append({"name": clean_name, "email": ""})
+
+    return candidates[:300]
+
+
+def canonicalize_owner_identity(
+    owner_name: str,
+    owner_email: str,
+    speaker_directory: list[dict] | None,
+    known_people: list[str] | None = None,
+) -> tuple[str, str]:
+    raw_name = (owner_name or "").strip()
+    raw_email = (owner_email or "").strip().lower()
+    if not raw_email and raw_name:
+        email_match = re.search(r"([A-Z0-9._%+\-]+@[A-Z0-9.\-]+\.[A-Z]{2,})", raw_name, re.IGNORECASE)
+        if email_match:
+            raw_email = email_match.group(1).strip().lower()
+            stripped_name = sanitize_text(raw_name.replace(email_match.group(1), "").strip("()<> -"))
+            if stripped_name:
+                raw_name = stripped_name
+
+    candidates = build_owner_candidates(speaker_directory, known_people)
+    if not candidates:
+        return raw_name, raw_email
+
+    if raw_email:
+        email_matches = [c for c in candidates if (c.get("email") or "").strip().lower() == raw_email]
+        if len(email_matches) == 1:
+            matched_name = (email_matches[0].get("name") or "").strip()
+            return matched_name or raw_name, raw_email
+
+    normalized_target = normalize_person_name(raw_name)
+    if not normalized_target:
+        return raw_name, raw_email
+
+    exact_matches = [c for c in candidates if normalize_person_name(c.get("name") or "") == normalized_target]
+    if len(exact_matches) == 1:
+        matched_name = (exact_matches[0].get("name") or "").strip()
+        matched_email = (exact_matches[0].get("email") or "").strip().lower() or raw_email
+        return matched_name or raw_name, matched_email
+
+    fuzzy_matches = [c for c in candidates if person_name_matches(c.get("name") or "", raw_name)]
+    unique_names = {(c.get("name") or "").strip() for c in fuzzy_matches if (c.get("name") or "").strip()}
+    if len(unique_names) == 1 and fuzzy_matches:
+        matched = fuzzy_matches[0]
+        matched_name = (matched.get("name") or "").strip()
+        matched_email = (matched.get("email") or "").strip().lower() or raw_email
+        return matched_name or raw_name, matched_email
+
+    return raw_name, raw_email
+
+
+def normalize_meeting_next_step_owners(
+    parsed: dict,
+    speaker_directory: list[dict] | None,
+    known_people: list[str] | None = None,
+):
+    next_steps = parsed.get("next_steps")
+    if not isinstance(next_steps, list):
+        return
+
+    for item in next_steps:
+        if not isinstance(item, dict):
+            continue
+        original_name = (item.get("owner_name") or "").strip()
+        original_email = (item.get("owner_email") or "").strip().lower()
+        canonical_name, canonical_email = canonicalize_owner_identity(
+            original_name,
+            original_email,
+            speaker_directory,
+            known_people=known_people,
+        )
+        if canonical_name and canonical_name != original_name:
+            item["owner_name"] = canonical_name
+            app.logger.info("Canonicalized meeting owner name: raw=%s canonical=%s", original_name, canonical_name)
+        if canonical_email and canonical_email != original_email:
+            item["owner_email"] = canonical_email
+
+
 def render_owner_reference(chat_id: str, owner_name: str, owner_email: str = "", speaker_directory: list[dict] | None = None) -> str:
     raw_name = (owner_name or "").strip()
     clean_name = raw_name
@@ -2361,6 +2460,7 @@ def analyze_meeting_with_gemini(
     transcript_text: str,
     media_bytes: bytes | None,
     media_mime_type: str | None,
+    owner_candidates: list[dict],
     known_people: list[str],
     learned_terms: list[str],
 ) -> dict:
@@ -2369,6 +2469,7 @@ def analyze_meeting_with_gemini(
         "minute_url": minute_url,
         "minute_meta": minute_meta,
         "transcript_excerpt": transcript_text,
+        "owner_candidates": owner_candidates,
         "known_people": known_people,
         "learned_terms": learned_terms,
     }
@@ -2614,6 +2715,7 @@ def build_meeting_reply(chat_id: str, request_text: str, minute_url: str, mode: 
         key = normalize_person_name(speaker_name)
         if key and all(normalize_person_name(existing) != key for existing in known_people):
             known_people.append(speaker_name)
+    owner_candidates = build_owner_candidates(speaker_directory, known_people)
     learned_terms = load_learned_terms(chat_id)
     parsed = analyze_meeting_with_gemini(
         request_text=request_text,
@@ -2622,9 +2724,11 @@ def build_meeting_reply(chat_id: str, request_text: str, minute_url: str, mode: 
         transcript_text=transcript_text,
         media_bytes=media_bytes,
         media_mime_type=media_mime_type,
+        owner_candidates=owner_candidates,
         known_people=known_people,
         learned_terms=learned_terms,
     )
+    normalize_meeting_next_step_owners(parsed, speaker_directory, known_people)
 
     title = build_meeting_post_title(minute_meta)
     reply_text = format_meeting_reply(
