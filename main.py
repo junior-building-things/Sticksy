@@ -1329,14 +1329,15 @@ def extract_speaker_directory_from_obj(obj) -> list[dict]:
     return out
 
 
-def extract_participant_directory_from_obj(obj) -> list[dict]:
+def extract_participant_directory_from_obj(obj, allow_name_only: bool = False) -> list[dict]:
     out: list[dict] = []
     seen: set[tuple[str, str, str]] = set()
 
     name_keys = {"speaker", "speaker_name", "name", "user_name", "display_name", "participant_name", "attendee_name"}
     email_keys = {"email", "speaker_email", "user_email", "email_address"}
+    participant_hints = ("participant", "attendee", "speaker", "member", "people", "user", "owner", "invitee")
 
-    def maybe_add(node):
+    def maybe_add(node, parent_key: str = ""):
         if not isinstance(node, dict):
             return
 
@@ -1347,7 +1348,15 @@ def extract_participant_directory_from_obj(obj) -> list[dict]:
         if not participant_name:
             return
         if not participant_email and not participant_open_id:
-            return
+            if not allow_name_only:
+                return
+            parent_hint = (parent_key or "").lower()
+            node_keys = {str(k).lower() for k in node.keys()}
+            has_context_hint = any(hint in parent_hint for hint in participant_hints)
+            has_node_hint = any(hint in key for key in node_keys for hint in participant_hints)
+            has_explicit_name_hint = bool(node_keys & {"participant_name", "attendee_name", "speaker_name", "user_name", "display_name"})
+            if not (has_context_hint or has_node_hint or has_explicit_name_hint):
+                return
 
         item_key = (normalize_person_name(participant_name), participant_email, participant_open_id)
         if item_key[0] and item_key not in seen:
@@ -1360,14 +1369,14 @@ def extract_participant_directory_from_obj(obj) -> list[dict]:
                 }
             )
 
-    def walk(node):
+    def walk(node, parent_key: str = ""):
         if isinstance(node, dict):
-            maybe_add(node)
-            for value in node.values():
-                walk(value)
+            maybe_add(node, parent_key=parent_key)
+            for key, value in node.items():
+                walk(value, parent_key=str(key).lower())
         elif isinstance(node, list):
             for item in node:
-                walk(item)
+                walk(item, parent_key=parent_key)
 
     walk(obj)
     return out
@@ -2678,12 +2687,12 @@ def build_meeting_reply(chat_id: str, request_text: str, minute_url: str, mode: 
     # Source 1: speaker emails from transcript text
     transcript_directory = extract_transcript_speaker_emails(transcript_text)
     # Source 2: participant info from statistics API
-    participant_directory = extract_participant_directory_from_obj(fetch_lark_minute_statistics(minute_token))
+    participant_directory = extract_participant_directory_from_obj(fetch_lark_minute_statistics(minute_token), allow_name_only=True)
     if not participant_directory:
         participant_directory = fetch_public_minute_page_people(minute_url, page_text=public_page_text or None)
     # Source 3: participant info from transcript JSON and minute metadata
-    meta_participants = extract_participant_directory_from_obj(minute_meta) if minute_meta else []
-    transcript_participants = extract_participant_directory_from_obj(transcript_data) if transcript_data else []
+    meta_participants = extract_participant_directory_from_obj(minute_meta, allow_name_only=True) if minute_meta else []
+    transcript_participants = extract_participant_directory_from_obj(transcript_data, allow_name_only=True) if transcript_data else []
 
     speaker_directory = merge_people_directories(
         participant_directory, transcript_directory, meta_participants, transcript_participants,
