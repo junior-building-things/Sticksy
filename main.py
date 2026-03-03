@@ -2334,6 +2334,29 @@ def extract_transcript_speaker_emails(transcript_text: str) -> list[dict]:
                 seen.add(key)
                 out.append({"name": speaker_name, "email": speaker_email})
 
+        speaker_label_patterns = [
+            re.compile(
+                r"^\s*(?:\[[^\]]{1,24}\]\s*)?([A-Za-z][A-Za-z0-9 .'\-]{0,79}|[\u4e00-\u9fff]{1,24})\s*:\s+\S",
+                re.IGNORECASE,
+            ),
+            re.compile(
+                r"^\s*(?:\d{1,2}:\d{2}(?::\d{2})?\s+)?([A-Za-z][A-Za-z0-9 .'\-]{0,79}|[\u4e00-\u9fff]{1,24})\s*:\s+\S",
+                re.IGNORECASE,
+            ),
+        ]
+        for pattern in speaker_label_patterns:
+            label_match = pattern.match(line_text)
+            if not label_match:
+                continue
+            speaker_name = sanitize_text((label_match.group(1) or "").strip(" -|"))
+            if not speaker_name:
+                continue
+            key = (normalize_person_name(speaker_name), "")
+            if key[0] and key not in seen:
+                seen.add(key)
+                out.append({"name": speaker_name, "email": ""})
+                break
+
         standalone_email = re.fullmatch(
             r"([A-Z0-9._%+\-]+@[A-Z0-9.\-]+\.[A-Z]{2,})",
             line_text,
