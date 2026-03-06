@@ -87,6 +87,17 @@ Constraints:
 - include up to 3 image keys from the provided image pool if they are relevant.
 """.strip()
 
+SUMMARY_EDIT_SYSTEM_PROMPT = """
+You are Sticksy, editing an existing summary according to the user's instruction.
+Return JSON only: {"edited_summary":"string"}.
+Rules:
+- Preserve the original language and structure unless the instruction requires a structural change.
+- Apply only the requested edit; keep all unaffected content intact.
+- Do not add new facts.
+- If the instruction is ambiguous, make the smallest reasonable edit.
+- If the instruction cannot be applied, return the original summary unchanged.
+""".strip()
+
 TOPIC_SYSTEM_PROMPT = """
 Extract up to 8 current discussion topics from recent group messages.
 Return JSON only: {"topics":[{"topic":"string","importance":1-5}]}
@@ -591,6 +602,202 @@ def rewrite_latest_summary_after_learning(chat_id: str, root_id: str | None, lea
     if rewritten != latest_summary:
         return rewritten
     return ""
+
+
+def parse_summary_edit_instruction(text_value: str) -> str:
+    match = re.match(r"^\s*edit\s+summary(?:\s*:\s*|\s+)(.+?)\s*$", text_value or "", re.IGNORECASE)
+    if not match:
+        return ""
+    return sanitize_text(match.group(1) or "")
+
+
+def parse_ordinal_position(text_value: str) -> int:
+    lowered = (text_value or "").lower()
+    word_map = {
+        "first": 1,
+        "second": 2,
+        "third": 3,
+        "fourth": 4,
+        "fifth": 5,
+        "sixth": 6,
+        "seventh": 7,
+        "eighth": 8,
+        "ninth": 9,
+        "tenth": 10,
+        "last": -1,
+    }
+    for word, value in word_map.items():
+        if re.search(rf"\b{word}\b", lowered):
+            return value
+    match = re.search(r"\b(\d+)(?:st|nd|rd|th)?\b", lowered)
+    if match:
+        try:
+            return int(match.group(1))
+        except Exception:
+            return 0
+    return 0
+
+
+def summary_section_name(line: str) -> str:
+    clean = re.sub(r"<[^>]+>", "", line or "").strip().lower()
+    clean = re.sub(r"\s+", " ", clean).rstrip(":")
+    if clean in {"meeting summary", "next steps"}:
+        return clean
+    return ""
+
+
+def section_range(lines: list[str], target_section: str) -> tuple[int, int]:
+    start_idx = -1
+    for idx, line in enumerate(lines):
+        if summary_section_name(line) == target_section:
+            start_idx = idx + 1
+            break
+    if start_idx < 0:
+        return -1, -1
+
+    end_idx = len(lines)
+    for idx in range(start_idx, len(lines)):
+        name = summary_section_name(lines[idx])
+        if name and name != target_section:
+            end_idx = idx
+            break
+    return start_idx, end_idx
+
+
+def renumber_numbered_lines(lines: list[str], start_idx: int, end_idx: int):
+    counter = 1
+    for idx in range(max(0, start_idx), min(len(lines), end_idx)):
+        match = re.match(r"^(\s*)\d+\.\s+(.*)$", lines[idx])
+        if not match:
+            continue
+        lines[idx] = f"{match.group(1)}{counter}. {match.group(2)}"
+        counter += 1
+
+
+def remove_nth_item_from_section(text_value: str, section_name: str, position: int) -> str:
+    if not text_value or position == 0:
+        return text_value
+    lines = (text_value or "").splitlines()
+    start_idx, end_idx = section_range(lines, section_name)
+    if start_idx < 0:
+        return text_value
+
+    item_indices = []
+    for idx in range(start_idx, end_idx):
+        if re.match(r"^\s*(?:[-*]|\d+\.)\s+\S", lines[idx]):
+            item_indices.append(idx)
+    if not item_indices:
+        return text_value
+
+    if position < 0:
+        remove_idx = item_indices[-1]
+    elif 0 < position <= len(item_indices):
+        remove_idx = item_indices[position - 1]
+    else:
+        return text_value
+
+    del lines[remove_idx]
+    if remove_idx < end_idx:
+        end_idx -= 1
+    renumber_numbered_lines(lines, start_idx, end_idx)
+    edited = "\n".join(lines)
+    edited = re.sub(r"\n{3,}", "\n\n", edited).strip()
+    return edited
+
+
+def remove_nth_item_from_any_list(text_value: str, position: int) -> str:
+    if not text_value or position == 0:
+        return text_value
+    lines = (text_value or "").splitlines()
+    item_indices = [idx for idx, line in enumerate(lines) if re.match(r"^\s*(?:[-*]|\d+\.)\s+\S", line)]
+    if not item_indices:
+        return text_value
+
+    if position < 0:
+        remove_idx = item_indices[-1]
+    elif 0 < position <= len(item_indices):
+        remove_idx = item_indices[position - 1]
+    else:
+        return text_value
+
+    del lines[remove_idx]
+    for section in ["meeting summary", "next steps"]:
+        start_idx, end_idx = section_range(lines, section)
+        if start_idx >= 0:
+            renumber_numbered_lines(lines, start_idx, end_idx)
+    edited = "\n".join(lines)
+    edited = re.sub(r"\n{3,}", "\n\n", edited).strip()
+    return edited
+
+
+def apply_structured_summary_edit(summary_text: str, instruction: str) -> str:
+    lowered = (instruction or "").lower()
+    if not lowered:
+        return summary_text
+
+    remove_intent = any(token in lowered for token in ["remove", "delete", "drop"])
+    if not remove_intent:
+        return summary_text
+
+    position = parse_ordinal_position(lowered)
+    if position == 0:
+        position = -1 if "last" in lowered else 1
+
+    if "next step" in lowered or "action item" in lowered or "todo" in lowered:
+        edited = remove_nth_item_from_section(summary_text, "next steps", position)
+        if edited != summary_text:
+            return edited
+
+    if "meeting summary" in lowered or "summary bullet" in lowered or "summary point" in lowered:
+        edited = remove_nth_item_from_section(summary_text, "meeting summary", position)
+        if edited != summary_text:
+            return edited
+
+    if any(token in lowered for token in ["bullet", "point", "item", "line", "step"]):
+        edited = remove_nth_item_from_any_list(summary_text, position)
+        if edited != summary_text:
+            return edited
+
+    return summary_text
+
+
+def edit_summary_with_gemini(chat_id: str, summary_text: str, instruction: str) -> str:
+    user_block = {
+        "instruction": instruction,
+        "summary": summary_text,
+        "learned_terms": load_learned_terms(chat_id),
+    }
+    config = types.GenerateContentConfig(
+        system_instruction=SUMMARY_EDIT_SYSTEM_PROMPT,
+        response_mime_type="application/json",
+    )
+    response = client.models.generate_content(
+        model=GEMINI_MODEL,
+        contents=json.dumps(user_block, ensure_ascii=False),
+        config=config,
+    )
+    raw = (response.text or "").strip()
+    parsed = json.loads(raw)
+    return (parsed.get("edited_summary") or "").strip()
+
+
+def edit_latest_summary(chat_id: str, root_id: str | None, instruction: str) -> tuple[str, str]:
+    latest_summary = latest_summary_output(chat_id, root_id=root_id)
+    if not latest_summary:
+        return "", ""
+
+    edited = apply_structured_summary_edit(latest_summary, instruction)
+    if edited and edited != latest_summary:
+        return latest_summary, edited
+
+    try:
+        model_edited = edit_summary_with_gemini(chat_id, latest_summary, instruction)
+        if model_edited and model_edited != latest_summary:
+            return latest_summary, model_edited
+    except Exception:
+        app.logger.exception("Summary edit via Gemini failed")
+
+    return latest_summary, ""
 
 
 def save_mentioned_identity(chat_id: str, open_id: str, display_name: str):
@@ -4103,6 +4310,42 @@ def webhook():
 
     for seg in segments:
         if not seg:
+            continue
+
+        edit_instruction = parse_summary_edit_instruction(seg)
+        if edit_instruction:
+            try:
+                original_summary, edited_summary = edit_latest_summary(chat_id, root_id, edit_instruction)
+                if not original_summary:
+                    edit_reply = "I couldn't find a recent summary to edit yet."
+                elif not edited_summary:
+                    edit_reply = "I couldn't apply that summary edit. Try a more specific edit instruction."
+                else:
+                    edit_reply = edited_summary
+                msg_id = send_lark_text_reply(
+                    message_id,
+                    edit_reply,
+                    mention_open_id=sender_open_id,
+                    mention_name=sender_name,
+                )
+                remember_bot_message(msg_id, chat_id)
+                save_bot_text(chat_id, edit_reply, root_id, message_id, event_message_id=msg_id)
+            except Exception:
+                app.logger.exception("Failed to process summary edit")
+            continue
+        if re.match(r"^\s*edit\s+summary\b", seg, re.IGNORECASE):
+            try:
+                prompt_text = 'Tell me what to edit after "Edit summary:".'
+                msg_id = send_lark_text_reply(
+                    message_id,
+                    prompt_text,
+                    mention_open_id=sender_open_id,
+                    mention_name=sender_name,
+                )
+                remember_bot_message(msg_id, chat_id)
+                save_bot_text(chat_id, prompt_text, root_id, message_id, event_message_id=msg_id)
+            except Exception:
+                app.logger.exception("Failed to send edit-summary prompt")
             continue
 
         learning_text = parse_learning_instruction(seg)
