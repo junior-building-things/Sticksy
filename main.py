@@ -1863,6 +1863,66 @@ def save_cached_meeting_summary(minute_token: str, mode: str, reply_text: str, t
         app.logger.warning("meeting_summary_cache write failed; cache disabled")
 
 
+def looks_like_meeting_summary_text(text_value: str) -> bool:
+    lowered = (text_value or "").strip().lower()
+    if not lowered:
+        return False
+    if "meeting summary:" in lowered or "<u>meeting summary:</u>" in lowered:
+        return True
+    if lowered.startswith("next steps:") or "<u>next steps:</u>" in lowered:
+        return True
+    return False
+
+
+def find_cached_meeting_summary_by_reply_text(reply_text: str) -> dict | None:
+    global MEETING_SUMMARY_CACHE_ENABLED
+    clean_reply = (reply_text or "").strip()
+    if not clean_reply or not MEETING_SUMMARY_CACHE_ENABLED:
+        return None
+    try:
+        return db_query_one(
+            """
+            SELECT minute_token, mode, title, source_chat_id, created_at_ts
+            FROM meeting_summary_cache
+            WHERE reply_text = :reply_text
+            ORDER BY created_at_ts DESC
+            LIMIT 1
+            """,
+            {"reply_text": clean_reply},
+        )
+    except Exception:
+        MEETING_SUMMARY_CACHE_ENABLED = False
+        app.logger.warning("meeting_summary_cache lookup-by-reply failed; cache disabled")
+        return None
+
+
+def sync_cached_meeting_summary_after_edit(original_summary: str, edited_summary: str, editor_chat_id: str = "") -> bool:
+    clean_original = (original_summary or "").strip()
+    clean_edited = (edited_summary or "").strip()
+    if not clean_original or not clean_edited or clean_original == clean_edited:
+        return False
+    if not looks_like_meeting_summary_text(clean_original):
+        return False
+
+    cached = find_cached_meeting_summary_by_reply_text(clean_original)
+    if not cached:
+        return False
+
+    save_cached_meeting_summary(
+        cached.get("minute_token") or "",
+        cached.get("mode") or "summary",
+        clean_edited,
+        cached.get("title") or "Meeting",
+        source_chat_id=(cached.get("source_chat_id") or editor_chat_id or ""),
+    )
+    app.logger.info(
+        "Meeting summary cache synced from edit: token=%s mode=%s",
+        cached.get("minute_token") or "",
+        cached.get("mode") or "summary",
+    )
+    return True
+
+
 def meeting_request_mode(text: str) -> str:
     lowered = (text or "").lower()
     has_url = bool(extract_minutes_url(text))
@@ -4458,6 +4518,7 @@ def webhook():
                     edit_reply = "I couldn't apply that summary edit. Try a more specific edit instruction."
                 else:
                     edit_reply = edited_summary
+                    sync_cached_meeting_summary_after_edit(original_summary, edited_summary, editor_chat_id=chat_id)
                 msg_id = send_lark_text_reply(
                     message_id,
                     edit_reply,
