@@ -99,6 +99,19 @@ Rules:
 - If the instruction cannot be applied, return the original summary unchanged.
 """.strip()
 
+SUMMARY_EDIT_REPLACEMENT_PARSE_PROMPT = """
+Extract phrase replacement rules from an edit instruction.
+Return JSON only:
+{
+  "replacements": [{"from":"string","to":"string"}]
+}
+Rules:
+- Prefer explicit `A -> B` mappings.
+- Preserve each side exactly (except trimming outer whitespace).
+- Return one item per mapping; do not merge mappings.
+- If no clear mapping exists, return an empty list.
+""".strip()
+
 TOPIC_SYSTEM_PROMPT = """
 Extract up to 8 current discussion topics from recent group messages.
 Return JSON only: {"topics":[{"topic":"string","importance":1-5}]}
@@ -626,6 +639,94 @@ def parse_summary_edit_instruction(text_value: str) -> str:
     return sanitize_text(match.group(1) or "")
 
 
+def parse_phrase_replacements_local(instruction: str) -> list[tuple[str, str]]:
+    if "->" not in (instruction or ""):
+        return []
+    raw = (instruction or "").strip()
+    candidates = [part.strip() for part in re.split(r"(?:\n+|;)+", raw) if part.strip()]
+
+    out: list[tuple[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for candidate in candidates:
+        if "->" not in candidate:
+            continue
+        left, right = candidate.split("->", 1)
+        source_text = left.strip(" \"'`")
+        target_text = right.strip(" \"'`")
+        if not source_text or not target_text:
+            continue
+        pair = (source_text, target_text)
+        if pair in seen:
+            continue
+        seen.add(pair)
+        out.append(pair)
+    return out
+
+
+def parse_phrase_replacements_with_gemini(instruction: str) -> list[tuple[str, str]]:
+    user_block = {"instruction": instruction}
+    config = types.GenerateContentConfig(
+        system_instruction=SUMMARY_EDIT_REPLACEMENT_PARSE_PROMPT,
+        response_mime_type="application/json",
+    )
+    response = client.models.generate_content(
+        model=GEMINI_MODEL,
+        contents=json.dumps(user_block, ensure_ascii=False),
+        config=config,
+    )
+    raw = (response.text or "").strip()
+    parsed = json.loads(raw)
+    items = parsed.get("replacements") or []
+
+    out: list[tuple[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        source_text = str(item.get("from") or "").strip(" \"'`")
+        target_text = str(item.get("to") or "").strip(" \"'`")
+        if not source_text or not target_text:
+            continue
+        pair = (source_text, target_text)
+        if pair in seen:
+            continue
+        seen.add(pair)
+        out.append(pair)
+    return out
+
+
+def parse_phrase_replacements(instruction: str) -> list[tuple[str, str]]:
+    arrow_count = (instruction or "").count("->")
+    local_pairs = parse_phrase_replacements_local(instruction)
+    if arrow_count <= 0:
+        return local_pairs
+    if len(local_pairs) >= arrow_count:
+        return local_pairs
+
+    try:
+        model_pairs = parse_phrase_replacements_with_gemini(instruction)
+        if model_pairs:
+            return model_pairs
+    except Exception:
+        app.logger.exception("Replacement parsing via Gemini failed")
+    # Avoid partial/incorrect edits when multiple mappings were requested but couldn't be reliably parsed.
+    if arrow_count > 1:
+        return []
+    return local_pairs
+
+
+def apply_phrase_replacements(summary_text: str, replacements: list[tuple[str, str]]) -> tuple[str, int]:
+    rewritten = summary_text or ""
+    change_count = 0
+    ordered_pairs = sorted(replacements, key=lambda item: len(item[0]), reverse=True)
+    for source_text, target_text in ordered_pairs:
+        updated = replace_term_occurrences(rewritten, source_text, target_text)
+        if updated != rewritten:
+            change_count += 1
+            rewritten = updated
+    return rewritten, change_count
+
+
 def parse_ordinal_position(text_value: str) -> int:
     lowered = (text_value or "").lower()
     word_map = {
@@ -800,6 +901,15 @@ def edit_latest_summary(chat_id: str, root_id: str | None, instruction: str) -> 
     latest_summary = latest_summary_output(chat_id, root_id=root_id)
     if not latest_summary:
         return "", ""
+
+    if "->" in (instruction or ""):
+        replacements = parse_phrase_replacements(instruction)
+        if not replacements:
+            return latest_summary, ""
+        edited_by_map, changes = apply_phrase_replacements(latest_summary, replacements)
+        if changes > 0 and edited_by_map != latest_summary:
+            return latest_summary, edited_by_map
+        return latest_summary, ""
 
     edited = apply_structured_summary_edit(latest_summary, instruction)
     if edited and edited != latest_summary:
