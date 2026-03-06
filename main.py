@@ -4436,14 +4436,26 @@ def send_missing_history_message(reply_to_message_id: str, chat_id: str):
 
 def is_authorized_meeting_requester(sender_open_id: str, sender_name: str, profile: dict | None = None) -> bool:
     clean_sender_id = (sender_open_id or "").strip()
-    if THOMAS_OPEN_ID:
-        return bool(clean_sender_id and clean_sender_id == THOMAS_OPEN_ID)
-
     expected_name = (THOMAS_DISPLAY_NAME or "Thomas").strip()
     if not expected_name:
         expected_name = "Thomas"
     profile_name = ((profile or {}).get("display_name") or "").strip()
-    return person_name_matches(sender_name, expected_name) or person_name_matches(profile_name, expected_name)
+    name_match = person_name_matches(sender_name, expected_name) or person_name_matches(profile_name, expected_name)
+
+    if THOMAS_OPEN_ID:
+        if clean_sender_id and clean_sender_id == THOMAS_OPEN_ID:
+            return True
+        if name_match:
+            app.logger.warning(
+                "Meeting requester authorized via name fallback; THOMAS_OPEN_ID mismatch/empty sender_open_id=%s sender_name=%s profile_name=%s",
+                clean_sender_id,
+                sender_name,
+                profile_name,
+            )
+            return True
+        return False
+
+    return name_match
 
 
 def looks_like_cjk(text: str) -> bool:
