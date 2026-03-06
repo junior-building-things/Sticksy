@@ -4434,6 +4434,18 @@ def send_missing_history_message(reply_to_message_id: str, chat_id: str):
     save_bot_text(chat_id, text, None, reply_to_message_id, event_message_id=msg_id)
 
 
+def is_authorized_meeting_requester(sender_open_id: str, sender_name: str, profile: dict | None = None) -> bool:
+    clean_sender_id = (sender_open_id or "").strip()
+    if THOMAS_OPEN_ID:
+        return bool(clean_sender_id and clean_sender_id == THOMAS_OPEN_ID)
+
+    expected_name = (THOMAS_DISPLAY_NAME or "Thomas").strip()
+    if not expected_name:
+        expected_name = "Thomas"
+    profile_name = ((profile or {}).get("display_name") or "").strip()
+    return person_name_matches(sender_name, expected_name) or person_name_matches(profile_name, expected_name)
+
+
 def looks_like_cjk(text: str) -> bool:
     return bool(re.search(r"[\u4e00-\u9fff]", text or ""))
 
@@ -5012,6 +5024,15 @@ def webhook():
 
         meeting_mode = meeting_request_mode(seg)
         if meeting_mode:
+            if not is_authorized_meeting_requester(sender_open_id, sender_name, profile):
+                app.logger.info(
+                    "Skipping meeting request from non-authorized sender: chat_id=%s sender_open_id=%s sender_name=%s mode=%s",
+                    chat_id,
+                    sender_open_id,
+                    sender_name,
+                    meeting_mode,
+                )
+                continue
             meeting_url = choose_meeting_url_for_request(chat_id, seg, sender_open_id, sender_name)
             if not meeting_url:
                 try:
