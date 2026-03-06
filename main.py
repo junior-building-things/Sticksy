@@ -588,7 +588,7 @@ def load_recent_bot_texts(chat_id: str, cutoff_ts: int, root_id: str | None = No
         "limit_rows": limit,
     }
     sql = """
-        SELECT text_content
+        SELECT id, text_content, created_at_ts
         FROM messages
         WHERE chat_id = :chat_id
           AND is_from_bot = 1
@@ -600,7 +600,7 @@ def load_recent_bot_texts(chat_id: str, cutoff_ts: int, root_id: str | None = No
     if root_id:
         sql += " AND root_id = :root_id"
         params["root_id"] = root_id
-    sql += " ORDER BY created_at_ts DESC LIMIT :limit_rows"
+    sql += " ORDER BY created_at_ts DESC, id DESC LIMIT :limit_rows"
     return db_query_all(sql, params)
 
 
@@ -725,6 +725,53 @@ def apply_phrase_replacements(summary_text: str, replacements: list[tuple[str, s
             change_count += 1
             rewritten = updated
     return rewritten, change_count
+
+
+def phrase_occurs(text_value: str, phrase: str) -> bool:
+    source = clean_term_candidate(phrase)
+    if not source:
+        return False
+    pattern = re.compile(
+        rf"(?<![0-9A-Za-z\u4e00-\u9fff]){re.escape(source)}(?![0-9A-Za-z\u4e00-\u9fff])",
+        flags=re.IGNORECASE,
+    )
+    return bool(pattern.search(text_value or ""))
+
+
+def replacement_match_score(summary_text: str, replacements: list[tuple[str, str]]) -> int:
+    score = 0
+    for source_text, _ in replacements:
+        if phrase_occurs(summary_text, source_text):
+            score += 1
+    return score
+
+
+def select_best_summary_for_replacements(chat_id: str, root_id: str | None, replacements: list[tuple[str, str]]) -> str:
+    if not replacements:
+        return ""
+
+    scopes = [root_id, None] if root_id else [None]
+    candidates: list[tuple[str, int, int, int]] = []
+    position = 0
+    for scoped_root in scopes:
+        rows = load_recent_bot_texts(chat_id, now_ts() - max(60, SUMMARY_REWRITE_LOOKBACK_SECONDS), root_id=scoped_root, limit=80)
+        for row in rows:
+            text_value = (row.get("text_content") or "").strip()
+            if not looks_like_summary_output(text_value):
+                position += 1
+                continue
+            score = replacement_match_score(text_value, replacements)
+            if score <= 0:
+                position += 1
+                continue
+            is_meeting = 1 if looks_like_meeting_summary_text(text_value) else 0
+            candidates.append((text_value, score, is_meeting, position))
+            position += 1
+
+    if not candidates:
+        return ""
+    best = max(candidates, key=lambda item: (item[1], item[2], -item[3]))
+    return best[0]
 
 
 def parse_ordinal_position(text_value: str) -> int:
@@ -898,31 +945,34 @@ def edit_summary_with_gemini(chat_id: str, summary_text: str, instruction: str) 
 
 
 def edit_latest_summary(chat_id: str, root_id: str | None, instruction: str) -> tuple[str, str]:
-    latest_summary = latest_summary_output(chat_id, root_id=root_id)
-    if not latest_summary:
+    target_summary = latest_summary_output(chat_id, root_id=root_id)
+    if not target_summary:
         return "", ""
 
     if "->" in (instruction or ""):
         replacements = parse_phrase_replacements(instruction)
         if not replacements:
-            return latest_summary, ""
-        edited_by_map, changes = apply_phrase_replacements(latest_summary, replacements)
-        if changes > 0 and edited_by_map != latest_summary:
-            return latest_summary, edited_by_map
-        return latest_summary, ""
+            return target_summary, ""
+        best_match_summary = select_best_summary_for_replacements(chat_id, root_id, replacements)
+        if best_match_summary:
+            target_summary = best_match_summary
+        edited_by_map, changes = apply_phrase_replacements(target_summary, replacements)
+        if changes > 0 and edited_by_map != target_summary:
+            return target_summary, edited_by_map
+        return target_summary, ""
 
-    edited = apply_structured_summary_edit(latest_summary, instruction)
-    if edited and edited != latest_summary:
-        return latest_summary, edited
+    edited = apply_structured_summary_edit(target_summary, instruction)
+    if edited and edited != target_summary:
+        return target_summary, edited
 
     try:
-        model_edited = edit_summary_with_gemini(chat_id, latest_summary, instruction)
-        if model_edited and model_edited != latest_summary:
-            return latest_summary, model_edited
+        model_edited = edit_summary_with_gemini(chat_id, target_summary, instruction)
+        if model_edited and model_edited != target_summary:
+            return target_summary, model_edited
     except Exception:
         app.logger.exception("Summary edit via Gemini failed")
 
-    return latest_summary, ""
+    return target_summary, ""
 
 
 def save_mentioned_identity(chat_id: str, open_id: str, display_name: str):
