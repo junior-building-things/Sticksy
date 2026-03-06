@@ -547,12 +547,22 @@ def extract_learning_replacements(instruction_text: str) -> list[tuple[str, str]
 
 
 def replace_term_occurrences(text_value: str, source_term: str, target_term: str) -> str:
+    raw_source = clean_replacement_target(source_term)
     source = clean_term_candidate(source_term)
     target = clean_replacement_target(target_term)
-    if not source or not target:
+    if not raw_source or not source or not target:
         return text_value
-    if source.casefold() == target.casefold():
+    if raw_source.casefold() == target.casefold() or source.casefold() == target.casefold():
         return text_value
+
+    # When source includes meaningful punctuation (for example "..."),
+    # prefer exact phrase replacement before normalized term matching.
+    if raw_source != source:
+        literal_pattern = re.compile(re.escape(raw_source), flags=re.IGNORECASE)
+        literal_updated = literal_pattern.sub(target, text_value or "")
+        if literal_updated != (text_value or ""):
+            return literal_updated
+
     pattern = re.compile(
         rf"(?<![0-9A-Za-z\u4e00-\u9fff]){re.escape(source)}(?![0-9A-Za-z\u4e00-\u9fff])",
         flags=re.IGNORECASE,
