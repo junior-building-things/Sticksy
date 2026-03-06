@@ -496,6 +496,13 @@ def clean_term_candidate(value: str) -> str:
     return cleaned
 
 
+def clean_replacement_target(value: str) -> str:
+    cleaned = (value or "").strip()
+    cleaned = cleaned.strip("`'\"“”‘’")
+    cleaned = re.sub(r"\s+", " ", cleaned)
+    return cleaned
+
+
 def extract_learning_replacements(instruction_text: str) -> list[tuple[str, str]]:
     cleaned = sanitize_text(instruction_text or "")
     if not cleaned:
@@ -541,8 +548,10 @@ def extract_learning_replacements(instruction_text: str) -> list[tuple[str, str]
 
 def replace_term_occurrences(text_value: str, source_term: str, target_term: str) -> str:
     source = clean_term_candidate(source_term)
-    target = clean_term_candidate(target_term)
-    if not source or not target or normalize_learning_key(source) == normalize_learning_key(target):
+    target = clean_replacement_target(target_term)
+    if not source or not target:
+        return text_value
+    if source.casefold() == target.casefold():
         return text_value
     pattern = re.compile(
         rf"(?<![0-9A-Za-z\u4e00-\u9fff]){re.escape(source)}(?![0-9A-Za-z\u4e00-\u9fff])",
