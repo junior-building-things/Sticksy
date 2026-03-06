@@ -727,6 +727,28 @@ def apply_phrase_replacements(summary_text: str, replacements: list[tuple[str, s
     return rewritten, change_count
 
 
+def summary_text_with_plain_mentions(text_value: str) -> str:
+    return re.sub(
+        r'<at\s+user_id="[^"]+">(.+?)</at>',
+        lambda match: f"@{(match.group(1) or '').strip()}",
+        text_value or "",
+        flags=re.IGNORECASE,
+    )
+
+
+def summary_text_with_tagged_mentions(text_value: str, chat_id: str) -> str:
+    def repl(match):
+        name = sanitize_text(match.group(1) or "")
+        if not name:
+            return match.group(0)
+        open_id = lookup_owner_open_id(chat_id, name)
+        if not open_id:
+            return f"@{name}"
+        return f'<at user_id="{open_id}">{name}</at>'
+
+    return re.sub(r"@([^:\n]{1,80})(?=:)", repl, text_value or "")
+
+
 def phrase_occurs(text_value: str, phrase: str) -> bool:
     source = clean_term_candidate(phrase)
     if not source:
@@ -1015,6 +1037,15 @@ def edit_latest_summary(chat_id: str, root_id: str | None, instruction: str) -> 
         edited_by_map, changes = apply_phrase_replacements(target_summary, replacements)
         if changes > 0 and edited_by_map != target_summary:
             return target_summary, edited_by_map
+        # If meeting summaries contain <at ...> tags, allow "@Name -> @Other" mappings by
+        # editing a plain-mention view and then restoring mention tags when resolvable.
+        if any("@" in source or "@" in target for source, target in replacements):
+            plain_target = summary_text_with_plain_mentions(target_summary)
+            edited_plain, plain_changes = apply_phrase_replacements(plain_target, replacements)
+            if plain_changes > 0 and edited_plain != plain_target:
+                edited_with_tags = summary_text_with_tagged_mentions(edited_plain, chat_id)
+                if edited_with_tags != target_summary:
+                    return target_summary, edited_with_tags
         return target_summary, ""
 
     edited = apply_structured_summary_edit(target_summary, instruction)
