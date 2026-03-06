@@ -4417,19 +4417,30 @@ def build_meeting_reply(chat_id: str, request_text: str, minute_url: str, mode: 
     return reply_text, title
 
 
-def send_missing_history_message(reply_to_message_id: str, chat_id: str):
-    if THOMAS_OPEN_ID:
-        text = "I don't have access to historical messages yet, let's check what's going on!"
-        mention_id = THOMAS_OPEN_ID
-    else:
-        text = "I don't have access to historical messages yet, Thomas let's check what's going on!"
-        mention_id = None
-    msg_id = send_lark_text_reply(
-        reply_to_message_id,
-        text,
-        mention_open_id=mention_id,
-        mention_name=THOMAS_DISPLAY_NAME,
-    )
+def send_missing_history_message(
+    reply_to_message_id: str,
+    chat_id: str,
+    requester_open_id: str = "",
+    requester_name: str = "",
+):
+    text = "I don't have access to historical messages yet, let's check what's going on!"
+    mention_id = (requester_open_id or "").strip() or THOMAS_OPEN_ID
+    mention_name = (requester_name or "").strip() or THOMAS_DISPLAY_NAME
+
+    msg_id = ""
+    try:
+        msg_id = send_lark_text_reply(
+            reply_to_message_id,
+            text,
+            mention_open_id=mention_id or None,
+            mention_name=mention_name or THOMAS_DISPLAY_NAME,
+        )
+    except Exception:
+        if mention_id:
+            app.logger.exception("Missing-history reply with mention failed; retrying without mention")
+            msg_id = send_lark_text_reply(reply_to_message_id, text)
+        else:
+            raise
     remember_bot_message(msg_id, chat_id)
     save_bot_text(chat_id, text, None, reply_to_message_id, event_message_id=msg_id)
 
@@ -5115,7 +5126,12 @@ def webhook():
             rows = load_messages_for_window(chat_id, window.start_ts, window.end_ts, root_id if message.get("root_id") else None)
             if not rows:
                 try:
-                    send_missing_history_message(message_id, chat_id)
+                    send_missing_history_message(
+                        message_id,
+                        chat_id,
+                        requester_open_id=sender_open_id,
+                        requester_name=sender_name,
+                    )
                     app.logger.info("No history found for summary window; sent fallback message")
                 except Exception:
                     app.logger.exception("Failed to send missing-history fallback")
@@ -5149,8 +5165,19 @@ def webhook():
                         app.logger.exception("Failed sending summary image reply")
                         continue
             except Exception:
-                # Outage/rate-limit behavior for summary: no message.
-                app.logger.exception("Summary generation/send failed; intentionally silent to user")
+                app.logger.exception("Summary generation/send failed")
+                try:
+                    unavailable_text = "I couldn't summarize that conversation just now."
+                    msg_id = send_lark_text_reply(
+                        message_id,
+                        unavailable_text,
+                        mention_open_id=sender_open_id,
+                        mention_name=sender_name,
+                    )
+                    remember_bot_message(msg_id, chat_id)
+                    save_bot_text(chat_id, unavailable_text, root_id, message_id, event_message_id=msg_id)
+                except Exception:
+                    app.logger.exception("Failed to send summary-unavailable reply")
                 continue
         else:
             # Non-summary mention must reply with sticker only; on failure, stay silent.
