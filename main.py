@@ -746,7 +746,7 @@ def summary_text_with_tagged_mentions(text_value: str, chat_id: str) -> str:
             return f"@{name}"
         return f'<at user_id="{open_id}">{name}</at>'
 
-    return re.sub(r"@([^:\n]{1,80})(?=:)", repl, text_value or "")
+    return re.sub(r"@([^@:\n]{1,80})(?=@|:)", repl, text_value or "")
 
 
 def phrase_occurs(text_value: str, phrase: str) -> bool:
@@ -762,9 +762,16 @@ def phrase_occurs(text_value: str, phrase: str) -> bool:
 
 def replacement_match_score(summary_text: str, replacements: list[tuple[str, str]]) -> int:
     score = 0
+    plain_text = ""
     for source_text, _ in replacements:
         if phrase_occurs(summary_text, source_text):
             score += 1
+            continue
+        if "@" in (source_text or ""):
+            if not plain_text:
+                plain_text = summary_text_with_plain_mentions(summary_text)
+            if phrase_occurs(plain_text, source_text):
+                score += 1
     return score
 
 
