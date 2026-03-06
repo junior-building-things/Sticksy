@@ -1601,37 +1601,65 @@ def extract_bot_segments(raw_text: str, mentions: list[dict]) -> list[str]:
     tokens = list(re.finditer(r"@_user_\d+", raw_text))
     bot_mentions = [m for m in mentions if is_bot_mention(m)]
 
-    if not tokens:
-        if bot_mentions:
-            t = sanitize_text(raw_text)
-            return [t] if t else []
-        return []
-
     mention_by_key = {}
     for m in mentions:
         key = m.get("key")
         if isinstance(key, str) and key:
             mention_by_key[key] = m
 
-    segments = []
-    bot_token_count = 0
+    def materialize_mentions(text_value: str) -> str:
+        resolved = text_value or ""
+        for mention in mentions:
+            key = mention.get("key")
+            if not isinstance(key, str) or not key:
+                continue
+            if key not in resolved:
+                continue
+            if is_bot_mention(mention):
+                resolved = resolved.replace(key, " ")
+                continue
+            display = mention_display_name(mention) or "someone"
+            resolved = resolved.replace(key, f"@{display}")
+        return resolved
+
+    if not tokens:
+        if bot_mentions:
+            t = sanitize_text(materialize_mentions(raw_text))
+            return [t] if t else []
+        return []
+
+    token_infos = []
     for i, token in enumerate(tokens):
         mention = mention_by_key.get(token.group(0))
         if not mention and i < len(mentions):
             mention = mentions[i]
-        if not mention or not is_bot_mention(mention):
-            continue
-        bot_token_count += 1
+        token_infos.append(
+            {
+                "token": token,
+                "is_bot": bool(mention and is_bot_mention(mention)),
+            }
+        )
 
+    bot_positions = [idx for idx, info in enumerate(token_infos) if info["is_bot"]]
+    if not bot_positions:
+        if bot_mentions:
+            t = sanitize_text(materialize_mentions(raw_text))
+            return [t] if t else []
+        return []
+
+    segments = []
+    for i, token_idx in enumerate(bot_positions):
+        token = token_infos[token_idx]["token"]
         start = token.end()
-        end = tokens[i + 1].start() if i + 1 < len(tokens) else len(raw_text)
-        seg = sanitize_text(raw_text[start:end])
+        end = token_infos[bot_positions[i + 1]]["token"].start() if i + 1 < len(bot_positions) else len(raw_text)
+        seg_raw = raw_text[start:end]
+        seg = sanitize_text(materialize_mentions(seg_raw))
         if seg:
             segments.append(seg)
 
-    if not segments and bot_token_count == 1:
+    if not segments and len(bot_positions) == 1:
         # Support patterns like "Hi @Sticksy" where user text appears before the mention.
-        cleaned = sanitize_text(re.sub(r"@_user_\d+", "", raw_text))
+        cleaned = sanitize_text(materialize_mentions(raw_text))
         if cleaned:
             segments.append(cleaned)
 
