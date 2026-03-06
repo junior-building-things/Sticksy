@@ -847,7 +847,7 @@ def summary_text_with_tagged_mentions(text_value: str, chat_id: str) -> str:
             return f"@{name}"
         return f'<at user_id="{open_id}">{name}</at>'
 
-    return re.sub(r"@([^@:\n]{1,80})(?=@|:)", repl, text_value or "")
+    return re.sub(r"@([^@\n:]{1,80}?)(?=(?:\s*@|@|:|\n|$|[.,;!?，。；！？]))", repl, text_value or "")
 
 
 def phrase_occurs(text_value: str, phrase: str) -> bool:
@@ -876,6 +876,12 @@ def replacement_match_score(summary_text: str, replacements: list[tuple[str, str
             if phrase_occurs(plain_text, source_text):
                 score += 1
                 continue
+            source_clean = clean_term_candidate(source_text)
+            if source_clean.startswith("@"):
+                bare_source = source_clean[1:].strip()
+                if bare_source and phrase_occurs(plain_text, bare_source):
+                    score += 1
+                    continue
             source_owner, source_task = split_owner_task(source_text)
             if "@" in source_owner and source_task and plain_lines and best_owner_line_index(plain_lines, source_task) >= 0:
                 score += 1
@@ -1156,6 +1162,28 @@ def edit_latest_summary(chat_id: str, root_id: str | None, instruction: str) -> 
         if any("@" in source or "@" in target for source, target in replacements):
             plain_target = summary_text_with_plain_mentions(target_summary)
             edited_plain, plain_changes = apply_phrase_replacements(plain_target, replacements)
+            if plain_changes <= 0 or edited_plain == plain_target:
+                mention_variants: list[tuple[str, str]] = []
+                seen_pairs: set[tuple[str, str]] = set()
+                for source_text, target_text in replacements:
+                    source_clean = clean_term_candidate(source_text)
+                    target_clean = clean_term_candidate(target_text)
+                    candidate_pairs = [(source_text, target_text)]
+                    if source_clean.startswith("@"):
+                        bare_source = source_clean[1:].strip()
+                        bare_target = target_clean[1:].strip() if target_clean.startswith("@") else target_clean
+                        if bare_source and bare_target:
+                            candidate_pairs.append((bare_source, bare_target))
+                    for candidate_source, candidate_target in candidate_pairs:
+                        if not candidate_source or not candidate_target:
+                            continue
+                        pair = (candidate_source, candidate_target)
+                        if pair in seen_pairs:
+                            continue
+                        seen_pairs.add(pair)
+                        mention_variants.append(pair)
+                if mention_variants and mention_variants != replacements:
+                    edited_plain, plain_changes = apply_phrase_replacements(plain_target, mention_variants)
             if plain_changes > 0 and edited_plain != plain_target:
                 edited_with_tags = summary_text_with_tagged_mentions(edited_plain, chat_id)
                 if edited_with_tags != target_summary:
