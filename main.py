@@ -774,6 +774,49 @@ def select_best_summary_for_replacements(chat_id: str, root_id: str | None, repl
     return best[0]
 
 
+def load_recent_cached_meeting_summaries(limit: int = 120) -> list[dict]:
+    global MEETING_SUMMARY_CACHE_ENABLED
+    if not MEETING_SUMMARY_CACHE_ENABLED:
+        return []
+    try:
+        return db_query_all(
+            """
+            SELECT minute_token, mode, reply_text, title, source_chat_id, created_at_ts
+            FROM meeting_summary_cache
+            WHERE reply_text IS NOT NULL AND reply_text <> ''
+            ORDER BY created_at_ts DESC
+            LIMIT :limit_rows
+            """,
+            {"limit_rows": limit},
+        )
+    except Exception:
+        MEETING_SUMMARY_CACHE_ENABLED = False
+        app.logger.warning("meeting_summary_cache scan failed; cache disabled")
+        return []
+
+
+def select_best_cached_meeting_summary_for_replacements(replacements: list[tuple[str, str]]) -> str:
+    if not replacements:
+        return ""
+    best_text = ""
+    best_score = 0
+    best_mode_rank = -1
+    for row in load_recent_cached_meeting_summaries(limit=120):
+        text_value = (row.get("reply_text") or "").strip()
+        if not text_value:
+            continue
+        score = replacement_match_score(text_value, replacements)
+        if score <= 0:
+            continue
+        mode_value = (row.get("mode") or "").strip().lower()
+        mode_rank = 1 if mode_value == "summary" else 0
+        if score > best_score or (score == best_score and mode_rank > best_mode_rank):
+            best_text = text_value
+            best_score = score
+            best_mode_rank = mode_rank
+    return best_text
+
+
 def parse_ordinal_position(text_value: str) -> int:
     lowered = (text_value or "").lower()
     word_map = {
@@ -953,9 +996,22 @@ def edit_latest_summary(chat_id: str, root_id: str | None, instruction: str) -> 
         replacements = parse_phrase_replacements(instruction)
         if not replacements:
             return target_summary, ""
-        best_match_summary = select_best_summary_for_replacements(chat_id, root_id, replacements)
-        if best_match_summary:
-            target_summary = best_match_summary
+        best_chat_summary = select_best_summary_for_replacements(chat_id, root_id, replacements)
+        best_cached_meeting = select_best_cached_meeting_summary_for_replacements(replacements)
+        if best_chat_summary and best_cached_meeting:
+            chat_score = replacement_match_score(best_chat_summary, replacements)
+            cache_score = replacement_match_score(best_cached_meeting, replacements)
+            if cache_score > chat_score:
+                target_summary = best_cached_meeting
+            elif cache_score < chat_score:
+                target_summary = best_chat_summary
+            else:
+                # Tie-breaker: prefer meeting-format cached summary to keep full meeting + next steps structure.
+                target_summary = best_cached_meeting if looks_like_meeting_summary_text(best_cached_meeting) else best_chat_summary
+        elif best_cached_meeting:
+            target_summary = best_cached_meeting
+        elif best_chat_summary:
+            target_summary = best_chat_summary
         edited_by_map, changes = apply_phrase_replacements(target_summary, replacements)
         if changes > 0 and edited_by_map != target_summary:
             return target_summary, edited_by_map
