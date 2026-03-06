@@ -2121,6 +2121,51 @@ def fetch_lark_user_identity(user_id: str, user_id_type: str = "open_id") -> dic
         return {"open_id": "", "display_name": ""}
 
 
+def resolve_sender_open_id(sender: dict) -> str:
+    sender_obj = sender or {}
+    sender_id = sender_obj.get("sender_id") or {}
+    candidates: list[tuple[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+
+    def add(value, id_type: str):
+        if not isinstance(value, str):
+            return
+        clean_value = value.strip()
+        clean_type = (id_type or "").strip().lower() or "open_id"
+        if not clean_value:
+            return
+        item = (clean_value, clean_type)
+        if item in seen:
+            return
+        seen.add(item)
+        candidates.append(item)
+
+    if isinstance(sender_id, dict):
+        add(sender_id.get("open_id"), "open_id")
+        add(sender_id.get("user_id"), "user_id")
+        add(sender_id.get("union_id"), "union_id")
+        raw_id = sender_id.get("id")
+        if isinstance(raw_id, str):
+            add(raw_id, "open_id" if raw_id.strip().startswith("ou_") else "user_id")
+    elif isinstance(sender_id, str):
+        add(sender_id, "open_id" if sender_id.strip().startswith("ou_") else "user_id")
+
+    add(sender_obj.get("open_id"), "open_id")
+    add(sender_obj.get("user_id"), "user_id")
+    add(sender_obj.get("union_id"), "union_id")
+
+    for identifier, id_type in candidates:
+        if id_type == "open_id":
+            return identifier
+
+    for identifier, id_type in candidates:
+        identity = fetch_lark_user_identity(identifier, user_id_type=id_type)
+        open_id = (identity.get("open_id") or "").strip()
+        if open_id:
+            return open_id
+    return ""
+
+
 def get_user_timezone(sender_open_id: str) -> str:
     profile = get_user_profile(sender_open_id)
     return profile.get("tz_name") or "UTC"
@@ -4441,9 +4486,26 @@ def is_authorized_meeting_requester(sender_open_id: str, sender_name: str, profi
         expected_name = "Thomas"
     profile_name = ((profile or {}).get("display_name") or "").strip()
     name_match = person_name_matches(sender_name, expected_name) or person_name_matches(profile_name, expected_name)
+    thomas_profile_name = ""
 
     if THOMAS_OPEN_ID:
         if clean_sender_id and clean_sender_id == THOMAS_OPEN_ID:
+            return True
+        try:
+            thomas_profile_name = (get_user_profile(THOMAS_OPEN_ID).get("display_name") or "").strip()
+        except Exception:
+            thomas_profile_name = ""
+        if thomas_profile_name and (
+            person_name_matches(sender_name, thomas_profile_name)
+            or person_name_matches(profile_name, thomas_profile_name)
+        ):
+            app.logger.warning(
+                "Meeting requester authorized via THOMAS profile-name fallback; sender_open_id=%s sender_name=%s profile_name=%s thomas_profile_name=%s",
+                clean_sender_id,
+                sender_name,
+                profile_name,
+                thomas_profile_name,
+            )
             return True
         if name_match:
             app.logger.warning(
@@ -4899,7 +4961,7 @@ def webhook():
     except Exception:
         content_obj = {}
 
-    sender_open_id = ((sender.get("sender_id") or {}).get("open_id")) or ""
+    sender_open_id = resolve_sender_open_id(sender)
     sender_name = sender.get("sender_name") or sender.get("name") or ""
     profile = get_user_profile(sender_open_id)
     if not sender_name or sender_name.lower() == "unknown":
