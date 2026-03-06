@@ -1875,16 +1875,31 @@ def remember_non_bot_mentions(chat_id: str, mentions: list[dict]):
         app.logger.warning("Could not resolve mentioned identities: chat_id=%s count=%s", chat_id, unresolved)
 
 
+def mention_matches_bot_open_id(mention: dict) -> bool:
+    if not LARK_BOT_OPEN_ID:
+        return False
+    direct_open_id = mention_open_id(mention)
+    if direct_open_id == LARK_BOT_OPEN_ID:
+        return True
+    for identifier, id_type in mention_id_candidates(mention):
+        if id_type == "open_id":
+            if identifier == LARK_BOT_OPEN_ID:
+                return True
+            continue
+        identity = fetch_lark_user_identity(identifier, user_id_type=id_type)
+        if (identity.get("open_id") or "").strip() == LARK_BOT_OPEN_ID:
+            return True
+    return False
+
+
 def is_bot_mention(mention: dict) -> bool:
-    open_id = mention_open_id(mention)
+    name = mention_display_name(mention).lower()
+    key = str(mention.get("key") or "").strip().lower()
+    if "sticksy" in name or "sticksy" in key:
+        return True
+
     if LARK_BOT_OPEN_ID:
-        if open_id == LARK_BOT_OPEN_ID:
-            return True
-        name = mention_display_name(mention).lower()
-        if name == "sticksy":
-            return True
-        key = str(mention.get("key") or "").strip().lower()
-        if "sticksy" in key:
+        if mention_matches_bot_open_id(mention):
             return True
         return False
     # Fallback when bot open_id is not configured: treat any mention as bot mention.
