@@ -56,6 +56,7 @@ client = genai.Client(api_key=GEMINI_API_KEY)
 _tenant_token_cache = {"token": None, "expires_at": 0}
 _db_lock = threading.Lock()
 _last_retention_sweep = 0.0
+MEETING_SUMMARY_CACHE_ENABLED = True
 
 
 # -------- Prompts --------
@@ -176,6 +177,7 @@ def db_query_one(query: str, params: dict | None = None) -> dict | None:
 
 
 def init_db():
+    global MEETING_SUMMARY_CACHE_ENABLED
     if IS_POSTGRES:
         schema_sql = [
             """
@@ -372,7 +374,14 @@ def init_db():
         ]
 
     for stmt in schema_sql:
-        db_execute(stmt)
+        try:
+            db_execute(stmt)
+        except Exception:
+            if "meeting_summary_cache" in stmt:
+                MEETING_SUMMARY_CACHE_ENABLED = False
+                app.logger.warning("meeting_summary_cache init failed; cache disabled")
+                continue
+            raise
 
 
 init_db()
@@ -386,6 +395,7 @@ def now_ts() -> int:
 
 
 def maybe_sweep_retention():
+    global MEETING_SUMMARY_CACHE_ENABLED
     global _last_retention_sweep
     current = time.time()
     if current - _last_retention_sweep < 3600:
@@ -398,7 +408,12 @@ def maybe_sweep_retention():
     db_execute("DELETE FROM user_timezone_cache WHERE cached_at_ts < :cutoff", {"cutoff": cutoff})
     db_execute("DELETE FROM user_profile_cache WHERE cached_at_ts < :cutoff", {"cutoff": cutoff})
     db_execute("DELETE FROM chat_profile_cache WHERE cached_at_ts < :cutoff", {"cutoff": cutoff})
-    db_execute("DELETE FROM meeting_summary_cache WHERE created_at_ts < :cutoff", {"cutoff": cutoff})
+    if MEETING_SUMMARY_CACHE_ENABLED:
+        try:
+            db_execute("DELETE FROM meeting_summary_cache WHERE created_at_ts < :cutoff", {"cutoff": cutoff})
+        except Exception:
+            MEETING_SUMMARY_CACHE_ENABLED = False
+            app.logger.warning("meeting_summary_cache retention sweep failed; cache disabled")
     _last_retention_sweep = current
 
 
@@ -1673,27 +1688,34 @@ def extract_minutes_token(minutes_url: str) -> str:
 
 
 def load_cached_meeting_summary(minute_token: str, mode: str) -> dict | None:
+    global MEETING_SUMMARY_CACHE_ENABLED
     clean_token = (minute_token or "").strip()
     clean_mode = (mode or "").strip() or "summary"
-    if not clean_token:
+    if not clean_token or not MEETING_SUMMARY_CACHE_ENABLED:
         return None
-    return db_query_one(
-        """
-        SELECT minute_token, mode, reply_text, title, source_chat_id, created_at_ts
-        FROM meeting_summary_cache
-        WHERE minute_token = :minute_token AND mode = :mode
-        LIMIT 1
-        """,
-        {"minute_token": clean_token, "mode": clean_mode},
-    )
+    try:
+        return db_query_one(
+            """
+            SELECT minute_token, mode, reply_text, title, source_chat_id, created_at_ts
+            FROM meeting_summary_cache
+            WHERE minute_token = :minute_token AND mode = :mode
+            LIMIT 1
+            """,
+            {"minute_token": clean_token, "mode": clean_mode},
+        )
+    except Exception:
+        MEETING_SUMMARY_CACHE_ENABLED = False
+        app.logger.warning("meeting_summary_cache read failed; cache disabled")
+        return None
 
 
 def save_cached_meeting_summary(minute_token: str, mode: str, reply_text: str, title: str, source_chat_id: str):
+    global MEETING_SUMMARY_CACHE_ENABLED
     clean_token = (minute_token or "").strip()
     clean_mode = (mode or "").strip() or "summary"
     clean_reply = (reply_text or "").strip()
     clean_title = (title or "").strip() or "Meeting"
-    if not clean_token or not clean_reply:
+    if not clean_token or not clean_reply or not MEETING_SUMMARY_CACHE_ENABLED:
         return
 
     params = {
@@ -1704,27 +1726,31 @@ def save_cached_meeting_summary(minute_token: str, mode: str, reply_text: str, t
         "source_chat_id": (source_chat_id or "").strip(),
         "created_at_ts": now_ts(),
     }
-    if IS_POSTGRES:
-        db_execute(
-            """
-            INSERT INTO meeting_summary_cache(minute_token, mode, reply_text, title, source_chat_id, created_at_ts)
-            VALUES(:minute_token, :mode, :reply_text, :title, :source_chat_id, :created_at_ts)
-            ON CONFLICT (minute_token, mode) DO UPDATE
-            SET reply_text = EXCLUDED.reply_text,
-                title = EXCLUDED.title,
-                source_chat_id = EXCLUDED.source_chat_id,
-                created_at_ts = EXCLUDED.created_at_ts
-            """,
-            params,
-        )
-    else:
-        db_execute(
-            """
-            INSERT OR REPLACE INTO meeting_summary_cache(minute_token, mode, reply_text, title, source_chat_id, created_at_ts)
-            VALUES(:minute_token, :mode, :reply_text, :title, :source_chat_id, :created_at_ts)
-            """,
-            params,
-        )
+    try:
+        if IS_POSTGRES:
+            db_execute(
+                """
+                INSERT INTO meeting_summary_cache(minute_token, mode, reply_text, title, source_chat_id, created_at_ts)
+                VALUES(:minute_token, :mode, :reply_text, :title, :source_chat_id, :created_at_ts)
+                ON CONFLICT (minute_token, mode) DO UPDATE
+                SET reply_text = EXCLUDED.reply_text,
+                    title = EXCLUDED.title,
+                    source_chat_id = EXCLUDED.source_chat_id,
+                    created_at_ts = EXCLUDED.created_at_ts
+                """,
+                params,
+            )
+        else:
+            db_execute(
+                """
+                INSERT OR REPLACE INTO meeting_summary_cache(minute_token, mode, reply_text, title, source_chat_id, created_at_ts)
+                VALUES(:minute_token, :mode, :reply_text, :title, :source_chat_id, :created_at_ts)
+                """,
+                params,
+            )
+    except Exception:
+        MEETING_SUMMARY_CACHE_ENABLED = False
+        app.logger.warning("meeting_summary_cache write failed; cache disabled")
 
 
 def meeting_request_mode(text: str) -> str:
@@ -4693,6 +4719,7 @@ def healthz():
 
 @app.route("/admin/clear-history", methods=["POST"])
 def admin_clear_history():
+    global MEETING_SUMMARY_CACHE_ENABLED
     if not ADMIN_API_KEY:
         return jsonify({"ok": False, "error": "ADMIN_API_KEY is not configured"}), 403
 
@@ -4709,7 +4736,12 @@ def admin_clear_history():
         db_execute("DELETE FROM topic_cache WHERE chat_id = :chat_id", {"chat_id": chat_id})
         db_execute("DELETE FROM learned_terms WHERE chat_id = :chat_id", {"chat_id": chat_id})
         db_execute("DELETE FROM mentioned_identities WHERE chat_id = :chat_id", {"chat_id": chat_id})
-        db_execute("DELETE FROM meeting_summary_cache WHERE source_chat_id = :chat_id", {"chat_id": chat_id})
+        if MEETING_SUMMARY_CACHE_ENABLED:
+            try:
+                db_execute("DELETE FROM meeting_summary_cache WHERE source_chat_id = :chat_id", {"chat_id": chat_id})
+            except Exception:
+                MEETING_SUMMARY_CACHE_ENABLED = False
+                app.logger.warning("meeting_summary_cache clear-by-chat failed; cache disabled")
         app.logger.warning("Admin cleared history for chat_id=%s", chat_id)
         return jsonify({"ok": True, "scope": "chat", "chat_id": chat_id})
 
@@ -4721,7 +4753,12 @@ def admin_clear_history():
     db_execute("DELETE FROM user_profile_cache", {})
     db_execute("DELETE FROM learned_terms", {})
     db_execute("DELETE FROM mentioned_identities", {})
-    db_execute("DELETE FROM meeting_summary_cache", {})
+    if MEETING_SUMMARY_CACHE_ENABLED:
+        try:
+            db_execute("DELETE FROM meeting_summary_cache", {})
+        except Exception:
+            MEETING_SUMMARY_CACHE_ENABLED = False
+            app.logger.warning("meeting_summary_cache clear-all failed; cache disabled")
     app.logger.warning("Admin cleared all history")
     return jsonify({"ok": True, "scope": "all"})
 
