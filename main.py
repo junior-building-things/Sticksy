@@ -1748,8 +1748,8 @@ def lark_message_is_from_bot(message_id: str) -> bool:
 def sanitize_text(s: str) -> str:
     text = (s or "").strip()
     text = re.sub(r"@_user_\d+", "", text)
-    text = re.sub(r"<at\\b[^>]*>.*?</at>", "", text, flags=re.IGNORECASE)
-    text = re.sub(r"@Sticksy\\b", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"<at\b[^>]*>.*?</at>", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"@Sticksy\b", "", text, flags=re.IGNORECASE)
     text = re.sub(r"\s+", " ", text).strip()
     return text
 
@@ -1954,9 +1954,20 @@ def extract_bot_segments(raw_text: str, mentions: list[dict]) -> list[str]:
 
     bot_positions = [idx for idx, info in enumerate(token_infos) if info["is_bot"]]
     if not bot_positions:
+        resolved_full = sanitize_text(materialize_mentions(raw_text))
         if bot_mentions:
-            t = sanitize_text(materialize_mentions(raw_text))
-            return [t] if t else []
+            return [resolved_full] if resolved_full else []
+        # Fallback: if mention metadata is missing/unresolvable but the message is clearly
+        # a mention-prefixed minutes command, treat it as directed to Sticksy.
+        if len(token_infos) == 1 and extract_minutes_url(resolved_full):
+            token = token_infos[0]["token"]
+            seg = sanitize_text(materialize_mentions(raw_text[token.end():]))
+            if seg:
+                app.logger.warning(
+                    "Heuristic bot-mention fallback applied for minutes command: token=%s",
+                    token.group(0),
+                )
+                return [seg]
         return []
 
     segments = []
