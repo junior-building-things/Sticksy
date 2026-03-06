@@ -1935,6 +1935,38 @@ def extract_bot_segments(raw_text: str, mentions: list[dict]) -> list[str]:
         return resolved
 
     if not tokens:
+        # Fallback for payloads that carry inline <at ...> tags in text but no mentions array.
+        inline_at_pattern = re.compile(r"<at\b([^>]*)>(.*?)</at>", flags=re.IGNORECASE | re.DOTALL)
+        inline_bot_hit = False
+
+        def inline_repl(match):
+            nonlocal inline_bot_hit
+            attrs = match.group(1) or ""
+            inner_name = sanitize_text(html.unescape(match.group(2) or ""))
+            user_id_match = re.search(r'user_id\s*=\s*"([^"]+)"', attrs, flags=re.IGNORECASE)
+            user_id = (user_id_match.group(1) if user_id_match else "").strip()
+            is_bot_tag = False
+            if LARK_BOT_OPEN_ID and user_id and user_id == LARK_BOT_OPEN_ID:
+                is_bot_tag = True
+            if not is_bot_tag and inner_name and "sticksy" in inner_name.lower():
+                is_bot_tag = True
+            if is_bot_tag:
+                inline_bot_hit = True
+                return " "
+            return f"@{inner_name}" if inner_name else " "
+
+        inline_materialized = inline_at_pattern.sub(inline_repl, raw_text)
+        if inline_bot_hit:
+            seg = sanitize_text(inline_materialized)
+            if seg:
+                return [seg]
+
+        # Fallback for plain-text mentions without mention metadata.
+        if re.search(r"@sticksy\b", raw_text, re.IGNORECASE):
+            seg = sanitize_text(re.sub(r"@sticksy\b", " ", raw_text, flags=re.IGNORECASE))
+            if seg:
+                return [seg]
+
         if bot_mentions:
             t = sanitize_text(materialize_mentions(raw_text))
             return [t] if t else []
