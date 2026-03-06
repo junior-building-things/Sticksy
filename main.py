@@ -48,6 +48,7 @@ TOPIC_WINDOW_HOURS = 6
 MAX_STICKER_UPLOAD_BYTES = int(os.environ.get("MAX_STICKER_UPLOAD_BYTES", "9500000"))
 MAX_MEETING_TRANSCRIPT_CHARS = int(os.environ.get("MAX_MEETING_TRANSCRIPT_CHARS", "120000"))
 MAX_MEETING_MEDIA_BYTES = int(os.environ.get("MAX_MEETING_MEDIA_BYTES", "18000000"))
+SUMMARY_REWRITE_LOOKBACK_SECONDS = int(os.environ.get("SUMMARY_REWRITE_LOOKBACK_SECONDS", "1800"))
 GLOBAL_LEARN_SCOPE = "__global__"
 
 client = genai.Client(api_key=GEMINI_API_KEY)
@@ -248,6 +249,18 @@ def init_db():
             )
             """,
             "CREATE INDEX IF NOT EXISTS idx_mentioned_identities_chat_time ON mentioned_identities(chat_id, created_at_ts DESC)",
+            """
+            CREATE TABLE IF NOT EXISTS meeting_summary_cache (
+              minute_token TEXT NOT NULL,
+              mode TEXT NOT NULL,
+              reply_text TEXT NOT NULL,
+              title TEXT NOT NULL,
+              source_chat_id TEXT,
+              created_at_ts BIGINT NOT NULL,
+              PRIMARY KEY (minute_token, mode)
+            )
+            """,
+            "CREATE INDEX IF NOT EXISTS idx_meeting_summary_cache_created ON meeting_summary_cache(created_at_ts DESC)",
         ]
     else:
         schema_sql = [
@@ -333,6 +346,18 @@ def init_db():
             )
             """,
             "CREATE INDEX IF NOT EXISTS idx_mentioned_identities_chat_time ON mentioned_identities(chat_id, created_at_ts DESC)",
+            """
+            CREATE TABLE IF NOT EXISTS meeting_summary_cache (
+              minute_token TEXT NOT NULL,
+              mode TEXT NOT NULL,
+              reply_text TEXT NOT NULL,
+              title TEXT NOT NULL,
+              source_chat_id TEXT,
+              created_at_ts INTEGER NOT NULL,
+              PRIMARY KEY (minute_token, mode)
+            )
+            """,
+            "CREATE INDEX IF NOT EXISTS idx_meeting_summary_cache_created ON meeting_summary_cache(created_at_ts DESC)",
         ]
 
     for stmt in schema_sql:
@@ -362,6 +387,7 @@ def maybe_sweep_retention():
     db_execute("DELETE FROM user_timezone_cache WHERE cached_at_ts < :cutoff", {"cutoff": cutoff})
     db_execute("DELETE FROM user_profile_cache WHERE cached_at_ts < :cutoff", {"cutoff": cutoff})
     db_execute("DELETE FROM chat_profile_cache WHERE cached_at_ts < :cutoff", {"cutoff": cutoff})
+    db_execute("DELETE FROM meeting_summary_cache WHERE created_at_ts < :cutoff", {"cutoff": cutoff})
     _last_retention_sweep = current
 
 
@@ -422,6 +448,149 @@ def load_learned_terms(chat_id: str, limit: int = 40) -> list[str]:
         {"chat_id": GLOBAL_LEARN_SCOPE, "limit_rows": limit},
     )
     return [(row.get("instruction_text") or "").strip() for row in rows if (row.get("instruction_text") or "").strip()]
+
+
+def clean_term_candidate(value: str) -> str:
+    cleaned = (value or "").strip()
+    cleaned = cleaned.strip("`'\"“”‘’.,;:()[]{}<>")
+    cleaned = re.sub(r"\s+", " ", cleaned)
+    return cleaned
+
+
+def extract_learning_replacements(instruction_text: str) -> list[tuple[str, str]]:
+    cleaned = sanitize_text(instruction_text or "")
+    if not cleaned:
+        return []
+    body = re.sub(r"^\s*that\s+", "", cleaned, flags=re.IGNORECASE).strip()
+
+    canonical = ""
+    parenthetical = ""
+    match = re.match(r"^\s*([^()]{1,100}?)\s*\(([^)]{1,140})\)\s*(?:refers to|means|is)\b", body, re.IGNORECASE)
+    if match:
+        canonical = clean_term_candidate(match.group(1))
+        parenthetical = match.group(2)
+    else:
+        match = re.match(r"^\s*([^()]{1,100}?)\s*(?:refers to|means|is)\b", body, re.IGNORECASE)
+        if match:
+            canonical = clean_term_candidate(match.group(1))
+
+    if not canonical:
+        return []
+
+    alias_candidates: list[str] = []
+    capture_pattern = r"(?:transcribed as|also transcribed as|sometimes transcribed as|aka|also called|written as)\s+([A-Za-z0-9][A-Za-z0-9\-/]{1,40})"
+    if parenthetical:
+        alias_candidates.extend(re.findall(capture_pattern, parenthetical, flags=re.IGNORECASE))
+        alias_candidates.extend(re.findall(r"\b[A-Za-z][A-Za-z0-9\-/]{1,40}\b", parenthetical))
+    alias_candidates.extend(re.findall(capture_pattern, body, flags=re.IGNORECASE))
+
+    stopwords = {"sometimes", "transcribed", "as", "also", "written", "called", "aka", "or", "and", "the", "that"}
+    canonical_key = normalize_learning_key(canonical)
+    replacements: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for alias in alias_candidates:
+        clean_alias = clean_term_candidate(alias)
+        alias_key = normalize_learning_key(clean_alias)
+        if not clean_alias or alias_key in seen or alias_key in stopwords:
+            continue
+        if alias_key == canonical_key:
+            continue
+        seen.add(alias_key)
+        replacements.append((clean_alias, canonical))
+    return replacements
+
+
+def replace_term_occurrences(text_value: str, source_term: str, target_term: str) -> str:
+    source = clean_term_candidate(source_term)
+    target = clean_term_candidate(target_term)
+    if not source or not target or normalize_learning_key(source) == normalize_learning_key(target):
+        return text_value
+    pattern = re.compile(
+        rf"(?<![0-9A-Za-z\u4e00-\u9fff]){re.escape(source)}(?![0-9A-Za-z\u4e00-\u9fff])",
+        flags=re.IGNORECASE,
+    )
+    return pattern.sub(target, text_value or "")
+
+
+def apply_learning_replacements(text_value: str, instructions: list[str]) -> str:
+    if not text_value:
+        return ""
+    replacement_map: dict[str, tuple[str, str]] = {}
+    for instruction in instructions:
+        for source_term, target_term in extract_learning_replacements(instruction):
+            source_key = normalize_learning_key(source_term)
+            if source_key and source_key not in replacement_map:
+                replacement_map[source_key] = (source_term, target_term)
+
+    rewritten = text_value
+    ordered_pairs = sorted(replacement_map.values(), key=lambda pair: len(pair[0]), reverse=True)
+    for source_term, target_term in ordered_pairs:
+        rewritten = replace_term_occurrences(rewritten, source_term, target_term)
+    return rewritten
+
+
+def looks_like_summary_output(text_value: str) -> bool:
+    lowered = (text_value or "").strip().lower()
+    if not lowered:
+        return False
+    if lowered.startswith("summary of "):
+        return True
+    if "meeting summary:" in lowered or "<u>meeting summary:</u>" in lowered:
+        return True
+    if lowered.startswith("next steps:") or "<u>next steps:</u>" in lowered:
+        return True
+    return False
+
+
+def load_recent_bot_texts(chat_id: str, cutoff_ts: int, root_id: str | None = None, limit: int = 40) -> list[dict]:
+    params = {
+        "chat_id": chat_id,
+        "cutoff_ts": cutoff_ts,
+        "limit_rows": limit,
+    }
+    sql = """
+        SELECT text_content
+        FROM messages
+        WHERE chat_id = :chat_id
+          AND is_from_bot = 1
+          AND message_type = 'text'
+          AND text_content IS NOT NULL
+          AND text_content <> ''
+          AND created_at_ts >= :cutoff_ts
+    """
+    if root_id:
+        sql += " AND root_id = :root_id"
+        params["root_id"] = root_id
+    sql += " ORDER BY created_at_ts DESC LIMIT :limit_rows"
+    return db_query_all(sql, params)
+
+
+def latest_summary_output(chat_id: str, root_id: str | None = None) -> str:
+    cutoff_ts = now_ts() - max(60, SUMMARY_REWRITE_LOOKBACK_SECONDS)
+    scopes = [root_id, None] if root_id else [None]
+    for scoped_root in scopes:
+        rows = load_recent_bot_texts(chat_id, cutoff_ts, root_id=scoped_root, limit=40)
+        for row in rows:
+            text_value = (row.get("text_content") or "").strip()
+            if looks_like_summary_output(text_value):
+                return text_value
+    return ""
+
+
+def rewrite_latest_summary_after_learning(chat_id: str, root_id: str | None, learning_text: str) -> str:
+    latest_summary = latest_summary_output(chat_id, root_id=root_id)
+    if not latest_summary:
+        return ""
+
+    rewritten = apply_learning_replacements(latest_summary, [learning_text])
+    if rewritten != latest_summary:
+        return rewritten
+
+    all_terms = load_learned_terms(chat_id)
+    rewritten = apply_learning_replacements(latest_summary, all_terms)
+    if rewritten != latest_summary:
+        return rewritten
+    return ""
 
 
 def save_mentioned_identity(chat_id: str, open_id: str, display_name: str):
@@ -1294,6 +1463,61 @@ def extract_minutes_url(text: str) -> str:
 def extract_minutes_token(minutes_url: str) -> str:
     match = re.search(r"/minutes/([A-Za-z0-9]+)", minutes_url or "", re.IGNORECASE)
     return match.group(1) if match else ""
+
+
+def load_cached_meeting_summary(minute_token: str, mode: str) -> dict | None:
+    clean_token = (minute_token or "").strip()
+    clean_mode = (mode or "").strip() or "summary"
+    if not clean_token:
+        return None
+    return db_query_one(
+        """
+        SELECT minute_token, mode, reply_text, title, source_chat_id, created_at_ts
+        FROM meeting_summary_cache
+        WHERE minute_token = :minute_token AND mode = :mode
+        LIMIT 1
+        """,
+        {"minute_token": clean_token, "mode": clean_mode},
+    )
+
+
+def save_cached_meeting_summary(minute_token: str, mode: str, reply_text: str, title: str, source_chat_id: str):
+    clean_token = (minute_token or "").strip()
+    clean_mode = (mode or "").strip() or "summary"
+    clean_reply = (reply_text or "").strip()
+    clean_title = (title or "").strip() or "Meeting"
+    if not clean_token or not clean_reply:
+        return
+
+    params = {
+        "minute_token": clean_token,
+        "mode": clean_mode,
+        "reply_text": clean_reply,
+        "title": clean_title,
+        "source_chat_id": (source_chat_id or "").strip(),
+        "created_at_ts": now_ts(),
+    }
+    if IS_POSTGRES:
+        db_execute(
+            """
+            INSERT INTO meeting_summary_cache(minute_token, mode, reply_text, title, source_chat_id, created_at_ts)
+            VALUES(:minute_token, :mode, :reply_text, :title, :source_chat_id, :created_at_ts)
+            ON CONFLICT (minute_token, mode) DO UPDATE
+            SET reply_text = EXCLUDED.reply_text,
+                title = EXCLUDED.title,
+                source_chat_id = EXCLUDED.source_chat_id,
+                created_at_ts = EXCLUDED.created_at_ts
+            """,
+            params,
+        )
+    else:
+        db_execute(
+            """
+            INSERT OR REPLACE INTO meeting_summary_cache(minute_token, mode, reply_text, title, source_chat_id, created_at_ts)
+            VALUES(:minute_token, :mode, :reply_text, :title, :source_chat_id, :created_at_ts)
+            """,
+            params,
+        )
 
 
 def meeting_request_mode(text: str) -> str:
@@ -3885,7 +4109,10 @@ def webhook():
         if learning_text:
             try:
                 save_learned_term(chat_id, learning_text, sender_name)
-                learned_reply = f"Learned for this chat: {learning_text}"
+                rewritten_summary = rewrite_latest_summary_after_learning(chat_id, root_id, learning_text)
+                learned_reply = rewritten_summary or f"Learned for this chat: {learning_text}"
+                if rewritten_summary:
+                    app.logger.info("Resent rewritten summary after learning update: chat_id=%s", chat_id)
                 msg_id = send_lark_text_reply(
                     message_id,
                     learned_reply,
@@ -3931,7 +4158,28 @@ def webhook():
                 continue
 
             try:
-                meeting_reply, meeting_title = build_meeting_reply(chat_id, seg, meeting_url, meeting_mode)
+                minute_token = extract_minutes_token(meeting_url)
+                cached = load_cached_meeting_summary(minute_token, meeting_mode) if minute_token else None
+                if cached and (cached.get("reply_text") or "").strip():
+                    meeting_reply = (cached.get("reply_text") or "").strip()
+                    meeting_title = (cached.get("title") or "").strip() or "Meeting"
+                    app.logger.info(
+                        "Meeting summary cache hit: token=%s mode=%s source_chat=%s",
+                        minute_token,
+                        meeting_mode,
+                        cached.get("source_chat_id") or "",
+                    )
+                else:
+                    meeting_reply, meeting_title = build_meeting_reply(chat_id, seg, meeting_url, meeting_mode)
+                    if minute_token:
+                        save_cached_meeting_summary(
+                            minute_token,
+                            meeting_mode,
+                            meeting_reply,
+                            meeting_title,
+                            source_chat_id=chat_id,
+                        )
+                        app.logger.info("Meeting summary cache stored: token=%s mode=%s", minute_token, meeting_mode)
                 msg_id = send_lark_post_reply(
                     message_id,
                     meeting_reply,
@@ -4218,6 +4466,7 @@ def admin_clear_history():
         db_execute("DELETE FROM topic_cache WHERE chat_id = :chat_id", {"chat_id": chat_id})
         db_execute("DELETE FROM learned_terms WHERE chat_id = :chat_id", {"chat_id": chat_id})
         db_execute("DELETE FROM mentioned_identities WHERE chat_id = :chat_id", {"chat_id": chat_id})
+        db_execute("DELETE FROM meeting_summary_cache WHERE source_chat_id = :chat_id", {"chat_id": chat_id})
         app.logger.warning("Admin cleared history for chat_id=%s", chat_id)
         return jsonify({"ok": True, "scope": "chat", "chat_id": chat_id})
 
@@ -4229,6 +4478,7 @@ def admin_clear_history():
     db_execute("DELETE FROM user_profile_cache", {})
     db_execute("DELETE FROM learned_terms", {})
     db_execute("DELETE FROM mentioned_identities", {})
+    db_execute("DELETE FROM meeting_summary_cache", {})
     app.logger.warning("Admin cleared all history")
     return jsonify({"ok": True, "scope": "all"})
 
