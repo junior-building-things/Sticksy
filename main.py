@@ -4549,6 +4549,13 @@ def is_authorized_meeting_requester(sender_open_id: str, sender_name: str, profi
     if THOMAS_OPEN_ID:
         if clean_sender_id and clean_sender_id == THOMAS_OPEN_ID:
             return True
+        if not clean_sender_id:
+            app.logger.warning(
+                "Meeting requester missing sender_open_id; allowing to avoid false-negative auth block sender_name=%s profile_name=%s",
+                sender_name,
+                profile_name,
+            )
+            return True
         try:
             thomas_profile_name = (get_user_profile(THOMAS_OPEN_ID).get("display_name") or "").strip()
         except Exception:
@@ -4785,6 +4792,11 @@ def should_respond(message: dict, content_obj: dict, normalized_text: str) -> tu
 
     if segments:
         return True, segments
+    if mentions:
+        bot_hint = any(is_bot_mention(m) for m in mentions if isinstance(m, dict))
+        if bot_hint:
+            fallback = sanitize_text(normalized_text or raw_text)
+            return (True, [fallback] if fallback else [])
     if mentions and re.search(r"\bsticksy\b", (raw_text or normalized_text or ""), re.IGNORECASE):
         fallback = sanitize_text(normalized_text or raw_text)
         return (True, [fallback] if fallback else [])
@@ -5068,6 +5080,18 @@ def webhook():
 
     should, segments = should_respond(message, content_obj, text_content)
     if not should:
+        probable_request_text = (content_obj.get("text") or text_content or "").strip()
+        if probable_request_text and (
+            extract_minutes_url(probable_request_text)
+            or re.search(r"\bsticksy\b", probable_request_text, re.IGNORECASE)
+        ):
+            app.logger.warning(
+                "Probable Sticksy request not triggered: chat_id=%s message_id=%s mentions=%s text=%s",
+                chat_id,
+                message_id,
+                len(mentions),
+                probable_request_text[:300],
+            )
         app.logger.info("No trigger detected for message_id=%s", message_id)
         return "", 200
 
@@ -5157,12 +5181,14 @@ def webhook():
         meeting_mode = meeting_request_mode(seg)
         if meeting_mode:
             if not is_authorized_meeting_requester(sender_open_id, sender_name, profile):
-                app.logger.info(
-                    "Skipping meeting request from non-authorized sender: chat_id=%s sender_open_id=%s sender_name=%s mode=%s",
+                app.logger.warning(
+                    "Skipping meeting request from non-authorized sender: chat_id=%s sender_open_id=%s sender_name=%s profile_name=%s mode=%s seg=%s",
                     chat_id,
                     sender_open_id,
                     sender_name,
+                    (profile.get("display_name") or "").strip(),
                     meeting_mode,
+                    seg[:220],
                 )
                 continue
             meeting_url = choose_meeting_url_for_request(chat_id, seg, sender_open_id, sender_name)
