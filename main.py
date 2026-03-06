@@ -727,6 +727,107 @@ def apply_phrase_replacements(summary_text: str, replacements: list[tuple[str, s
     return rewritten, change_count
 
 
+def normalize_task_text(text_value: str) -> str:
+    cleaned = re.sub(r"\s+", " ", (text_value or "").strip())
+    cleaned = cleaned.strip(" .,:;!?")
+    return cleaned.lower()
+
+
+def task_token_set(text_value: str) -> set[str]:
+    return {tok for tok in re.findall(r"[0-9A-Za-z\u4e00-\u9fff]+", normalize_task_text(text_value)) if len(tok) > 1}
+
+
+def split_owner_task(text_value: str) -> tuple[str, str]:
+    raw = (text_value or "").strip()
+    if ":" not in raw:
+        return raw, ""
+    owner, task = raw.split(":", 1)
+    return owner.strip(), task.strip()
+
+
+def owner_mention_names(owner_text: str) -> list[str]:
+    out = []
+    seen = set()
+    for match in re.finditer(r"@([^@:\n]{1,80})", owner_text or ""):
+        name = sanitize_text(match.group(1) or "")
+        key = normalize_person_name(name)
+        if not name or not key or key in seen:
+            continue
+        seen.add(key)
+        out.append(name)
+    return out
+
+
+def best_owner_line_index(lines: list[str], source_task: str) -> int:
+    source_norm = normalize_task_text(source_task)
+    source_tokens = task_token_set(source_task)
+    best_idx = -1
+    best_score = 0.0
+    for idx, line in enumerate(lines):
+        body = re.sub(r"^\s*\d+\.\s*", "", line)
+        owner_part, task_part = split_owner_task(body)
+        if not task_part or "@" not in owner_part:
+            continue
+        task_norm = normalize_task_text(task_part)
+        if source_norm and task_norm == source_norm:
+            return idx
+        task_tokens = task_token_set(task_part)
+        if not source_tokens or not task_tokens:
+            continue
+        overlap = len(source_tokens & task_tokens)
+        if overlap <= 0:
+            continue
+        score = overlap / max(1, len(source_tokens))
+        if score > best_score:
+            best_score = score
+            best_idx = idx
+    if best_score >= 0.45:
+        return best_idx
+    return -1
+
+
+def apply_owner_line_replacements(summary_text: str, replacements: list[tuple[str, str]]) -> tuple[str, int]:
+    lines = (summary_text or "").splitlines()
+    if not lines:
+        return summary_text or "", 0
+    changes = 0
+    for source_text, target_text in replacements:
+        source_owner, source_task = split_owner_task(source_text)
+        target_owner, _target_task = split_owner_task(target_text)
+        if "@" not in source_owner or "@" not in target_owner or not source_task:
+            continue
+        line_idx = best_owner_line_index(lines, source_task)
+        if line_idx < 0:
+            continue
+
+        line = lines[line_idx]
+        number_match = re.match(r"^(\s*\d+\.\s*)(.*)$", line)
+        prefix = number_match.group(1) if number_match else ""
+        body = number_match.group(2) if number_match else line
+        owner_part, task_part = split_owner_task(body)
+        if not task_part:
+            continue
+        source_names = owner_mention_names(source_owner)
+        if source_names:
+            owner_has_source = any(phrase_occurs(owner_part, f"@{name}") for name in source_names)
+            if not owner_has_source:
+                continue
+        if normalize_task_text(task_part) != normalize_task_text(source_task):
+            source_tokens = task_token_set(source_task)
+            task_tokens = task_token_set(task_part)
+            overlap = len(source_tokens & task_tokens) / max(1, len(source_tokens))
+            if overlap < 0.45:
+                continue
+        if ":" not in body:
+            continue
+        new_body = f"{target_owner}: {task_part}"
+        if new_body == body:
+            continue
+        lines[line_idx] = f"{prefix}{new_body}"
+        changes += 1
+    return "\n".join(lines), changes
+
+
 def summary_text_with_plain_mentions(text_value: str) -> str:
     return re.sub(
         r'<at\s+user_id="[^"]+">(.+?)</at>',
@@ -763,6 +864,7 @@ def phrase_occurs(text_value: str, phrase: str) -> bool:
 def replacement_match_score(summary_text: str, replacements: list[tuple[str, str]]) -> int:
     score = 0
     plain_text = ""
+    plain_lines: list[str] = []
     for source_text, _ in replacements:
         if phrase_occurs(summary_text, source_text):
             score += 1
@@ -770,7 +872,12 @@ def replacement_match_score(summary_text: str, replacements: list[tuple[str, str
         if "@" in (source_text or ""):
             if not plain_text:
                 plain_text = summary_text_with_plain_mentions(summary_text)
+                plain_lines = plain_text.splitlines()
             if phrase_occurs(plain_text, source_text):
+                score += 1
+                continue
+            source_owner, source_task = split_owner_task(source_text)
+            if "@" in source_owner and source_task and plain_lines and best_owner_line_index(plain_lines, source_task) >= 0:
                 score += 1
     return score
 
@@ -1053,6 +1160,11 @@ def edit_latest_summary(chat_id: str, root_id: str | None, instruction: str) -> 
                 edited_with_tags = summary_text_with_tagged_mentions(edited_plain, chat_id)
                 if edited_with_tags != target_summary:
                     return target_summary, edited_with_tags
+            owner_edited_plain, owner_changes = apply_owner_line_replacements(plain_target, replacements)
+            if owner_changes > 0 and owner_edited_plain != plain_target:
+                owner_edited_with_tags = summary_text_with_tagged_mentions(owner_edited_plain, chat_id)
+                if owner_edited_with_tags != target_summary:
+                    return target_summary, owner_edited_with_tags
         return target_summary, ""
 
     edited = apply_structured_summary_edit(target_summary, instruction)
