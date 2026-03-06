@@ -649,19 +649,29 @@ def parse_summary_edit_instruction(text_value: str) -> str:
 
 
 def parse_phrase_replacements_local(instruction: str) -> list[tuple[str, str]]:
-    if "->" not in (instruction or ""):
-        return []
     raw = (instruction or "").strip()
+    if not raw:
+        return []
     candidates = [part.strip() for part in re.split(r"(?:\n+|;)+", raw) if part.strip()]
 
     out: list[tuple[str, str]] = []
     seen: set[tuple[str, str]] = set()
     for candidate in candidates:
-        if "->" not in candidate:
-            continue
-        left, right = candidate.split("->", 1)
-        source_text = left.strip(" \"'`")
-        target_text = right.strip(" \"'`")
+        source_text = ""
+        target_text = ""
+        if "->" in candidate:
+            left, right = candidate.split("->", 1)
+            source_text = left.strip(" \"'`")
+            target_text = right.strip(" \"'`")
+        else:
+            replace_match = re.match(
+                r"^\s*(?:replace|change)\s+(.+?)\s+(?:with|to)\s+(.+?)\s*$",
+                candidate,
+                re.IGNORECASE,
+            )
+            if replace_match:
+                source_text = (replace_match.group(1) or "").strip(" \"'`")
+                target_text = (replace_match.group(2) or "").strip(" \"'`")
         if not source_text or not target_text:
             continue
         pair = (source_text, target_text)
@@ -1143,10 +1153,8 @@ def edit_latest_summary(chat_id: str, root_id: str | None, instruction: str) -> 
     if not target_summary:
         return "", ""
 
-    if "->" in (instruction or ""):
-        replacements = parse_phrase_replacements(instruction)
-        if not replacements:
-            return target_summary, ""
+    replacements = parse_phrase_replacements(instruction)
+    if replacements:
         best_chat_summary = select_best_summary_for_replacements(chat_id, root_id, replacements)
         best_cached_meeting = select_best_cached_meeting_summary_for_replacements(replacements)
         if best_chat_summary and best_cached_meeting:
