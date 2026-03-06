@@ -4537,54 +4537,6 @@ def send_missing_history_message(reply_to_message_id: str, chat_id: str):
     save_bot_text(chat_id, text, None, reply_to_message_id, event_message_id=msg_id)
 
 
-def is_authorized_meeting_requester(sender_open_id: str, sender_name: str, profile: dict | None = None) -> bool:
-    clean_sender_id = (sender_open_id or "").strip()
-    expected_name = (THOMAS_DISPLAY_NAME or "Thomas").strip()
-    if not expected_name:
-        expected_name = "Thomas"
-    profile_name = ((profile or {}).get("display_name") or "").strip()
-    name_match = person_name_matches(sender_name, expected_name) or person_name_matches(profile_name, expected_name)
-    thomas_profile_name = ""
-
-    if THOMAS_OPEN_ID:
-        if clean_sender_id and clean_sender_id == THOMAS_OPEN_ID:
-            return True
-        if not clean_sender_id:
-            app.logger.warning(
-                "Meeting requester missing sender_open_id; allowing to avoid false-negative auth block sender_name=%s profile_name=%s",
-                sender_name,
-                profile_name,
-            )
-            return True
-        try:
-            thomas_profile_name = (get_user_profile(THOMAS_OPEN_ID).get("display_name") or "").strip()
-        except Exception:
-            thomas_profile_name = ""
-        if thomas_profile_name and (
-            person_name_matches(sender_name, thomas_profile_name)
-            or person_name_matches(profile_name, thomas_profile_name)
-        ):
-            app.logger.warning(
-                "Meeting requester authorized via THOMAS profile-name fallback; sender_open_id=%s sender_name=%s profile_name=%s thomas_profile_name=%s",
-                clean_sender_id,
-                sender_name,
-                profile_name,
-                thomas_profile_name,
-            )
-            return True
-        if name_match:
-            app.logger.warning(
-                "Meeting requester authorized via name fallback; THOMAS_OPEN_ID mismatch/empty sender_open_id=%s sender_name=%s profile_name=%s",
-                clean_sender_id,
-                sender_name,
-                profile_name,
-            )
-            return True
-        return False
-
-    return name_match
-
-
 def looks_like_cjk(text: str) -> bool:
     return bool(re.search(r"[\u4e00-\u9fff]", text or ""))
 
@@ -5180,17 +5132,6 @@ def webhook():
 
         meeting_mode = meeting_request_mode(seg)
         if meeting_mode:
-            if not is_authorized_meeting_requester(sender_open_id, sender_name, profile):
-                app.logger.warning(
-                    "Skipping meeting request from non-authorized sender: chat_id=%s sender_open_id=%s sender_name=%s profile_name=%s mode=%s seg=%s",
-                    chat_id,
-                    sender_open_id,
-                    sender_name,
-                    (profile.get("display_name") or "").strip(),
-                    meeting_mode,
-                    seg[:220],
-                )
-                continue
             meeting_url = choose_meeting_url_for_request(chat_id, seg, sender_open_id, sender_name)
             if not meeting_url:
                 try:
