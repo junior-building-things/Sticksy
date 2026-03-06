@@ -1097,10 +1097,102 @@ def remove_nth_item_from_any_list(text_value: str, position: int) -> str:
     return edited
 
 
-def apply_structured_summary_edit(summary_text: str, instruction: str) -> str:
+def parse_next_step_owner_change_instruction(instruction: str) -> tuple[int, str]:
+    lowered = (instruction or "").lower()
+    if not lowered:
+        return 0, ""
+    if "owner" not in lowered or "next step" not in lowered:
+        return 0, ""
+    if not any(token in lowered for token in ["change", "set", "update", "assign", "replace"]):
+        return 0, ""
+
+    position = parse_ordinal_position(lowered)
+    if position == 0:
+        step_match = re.search(r"next\s+step(?:s)?\s*(\d+)", lowered)
+        if step_match:
+            try:
+                position = int(step_match.group(1))
+            except Exception:
+                position = 0
+    if position == 0:
+        return 0, ""
+
+    owner_match = re.search(r"\b(?:to|as)\s+(.+?)\s*$", instruction or "", re.IGNORECASE)
+    if not owner_match:
+        return 0, ""
+    owner_text = sanitize_text(owner_match.group(1) or "").strip(" .,;")
+    if not owner_text:
+        return 0, ""
+    if not owner_text.startswith("@") and not owner_text.lower().startswith("<at "):
+        owner_text = f"@{owner_text}"
+    return position, owner_text
+
+
+def change_owner_for_nth_next_step(summary_text: str, position: int, owner_text: str, chat_id: str) -> str:
+    if not summary_text or position == 0 or not owner_text:
+        return summary_text
+
+    lines = (summary_text or "").splitlines()
+    start_idx, end_idx = section_range(lines, "next steps")
+    if start_idx < 0:
+        return summary_text
+
+    step_indices = []
+    for idx in range(start_idx, end_idx):
+        if re.match(r"^\s*(?:\d+\.|[-*])\s+\S", lines[idx]):
+            step_indices.append(idx)
+    if not step_indices:
+        return summary_text
+
+    if position < 0:
+        target_idx = step_indices[-1]
+    elif 0 < position <= len(step_indices):
+        target_idx = step_indices[position - 1]
+    else:
+        return summary_text
+
+    line = lines[target_idx]
+    number_match = re.match(r"^(\s*\d+\.\s*)(.*)$", line)
+    prefix = number_match.group(1) if number_match else ""
+    body = number_match.group(2) if number_match else re.sub(r"^\s*[-*]\s+", "", line)
+
+    _owner_part, task_part = split_owner_task(body)
+    task_text = task_part.strip()
+    if not task_text:
+        task_text = re.sub(
+            r"^\s*(?:(?:<at\s+user_id=\"[^\"]+\">[^<]+</at>|@[^\s:]+)\s*)+\:?\s*",
+            "",
+            body,
+            count=1,
+            flags=re.IGNORECASE,
+        ).strip()
+    if not task_text:
+        return summary_text
+
+    normalized_owner = sanitize_text(owner_text or "").strip()
+    if not normalized_owner:
+        return summary_text
+    if "@" in normalized_owner:
+        normalized_owner = summary_text_with_tagged_mentions(normalized_owner, chat_id)
+
+    new_body = f"{normalized_owner}: {task_text}"
+    if new_body == body:
+        return summary_text
+
+    lines[target_idx] = f"{prefix}{new_body}"
+    return "\n".join(lines)
+
+
+def apply_structured_summary_edit(summary_text: str, instruction: str, chat_id: str) -> str:
     lowered = (instruction or "").lower()
     if not lowered:
         return summary_text
+
+    owner_position, owner_text = parse_next_step_owner_change_instruction(instruction)
+    if owner_position:
+        updated = change_owner_for_nth_next_step(summary_text, owner_position, owner_text, chat_id)
+        if updated != summary_text:
+            return updated
 
     remove_intent = any(token in lowered for token in ["remove", "delete", "drop"])
     if not remove_intent:
@@ -1152,6 +1244,10 @@ def edit_latest_summary(chat_id: str, root_id: str | None, instruction: str) -> 
     target_summary = latest_summary_output(chat_id, root_id=root_id)
     if not target_summary:
         return "", ""
+
+    structured_edited = apply_structured_summary_edit(target_summary, instruction, chat_id)
+    if structured_edited and structured_edited != target_summary:
+        return target_summary, structured_edited
 
     replacements = parse_phrase_replacements(instruction)
     if replacements:
@@ -1211,10 +1307,6 @@ def edit_latest_summary(chat_id: str, root_id: str | None, instruction: str) -> 
                 if owner_edited_with_tags != target_summary:
                     return target_summary, owner_edited_with_tags
         return target_summary, ""
-
-    edited = apply_structured_summary_edit(target_summary, instruction)
-    if edited and edited != target_summary:
-        return target_summary, edited
 
     try:
         model_edited = edit_summary_with_gemini(chat_id, target_summary, instruction)
