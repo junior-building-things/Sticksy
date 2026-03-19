@@ -674,14 +674,23 @@ def parse_phrase_replacements_local(instruction: str) -> list[tuple[str, str]]:
             source_text = left.strip(" \"'`")
             target_text = right.strip(" \"'`")
         else:
-            replace_match = re.match(
-                r"^\s*(?:replace|change)\s+(.+?)\s+(?:with|to)\s+(.+?)\s*$",
+            quoted_match = re.match(
+                r"^\s*(?:replace|change)\s+([\"'`])(.+?)\1\s+(?:with|to)\s+([\"'`])(.+?)\3\s*$",
                 candidate,
                 re.IGNORECASE,
             )
-            if replace_match:
-                source_text = (replace_match.group(1) or "").strip(" \"'`")
-                target_text = (replace_match.group(2) or "").strip(" \"'`")
+            if quoted_match:
+                source_text = (quoted_match.group(2) or "").strip()
+                target_text = (quoted_match.group(4) or "").strip()
+            else:
+                replace_match = re.match(
+                    r"^\s*(?:replace|change)\s+(.+?)\s+(?:with|to)\s+(.+?)\s*$",
+                    candidate,
+                    re.IGNORECASE,
+                )
+                if replace_match:
+                    source_text = (replace_match.group(1) or "").strip(" \"'`")
+                    target_text = (replace_match.group(2) or "").strip(" \"'`")
         if not source_text or not target_text:
             continue
         pair = (source_text, target_text)
