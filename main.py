@@ -653,9 +653,17 @@ def rewrite_latest_summary_after_learning(chat_id: str, root_id: str | None, lea
 
 def parse_summary_edit_instruction(text_value: str) -> str:
     match = re.match(r"^\s*edit\s+summary(?:\s*:\s*|\s+)(.+?)\s*$", text_value or "", re.IGNORECASE)
-    if not match:
-        return ""
-    return sanitize_text(match.group(1) or "")
+    if match:
+        return sanitize_text(match.group(1) or "")
+
+    direct_text = sanitize_text(text_value or "")
+    if re.match(
+        r"^\s*(?:add|insert)\s+(?:a\s+new\s+)?(?:meeting\s+summary|summary)\s+(?:point|bullet|item)\b",
+        direct_text,
+        re.IGNORECASE,
+    ):
+        return direct_text
+    return ""
 
 
 def parse_phrase_replacements_local(instruction: str) -> list[tuple[str, str]]:
@@ -1116,6 +1124,55 @@ def remove_nth_item_from_any_list(text_value: str, position: int) -> str:
     return edited
 
 
+def parse_summary_point_insert_instruction(instruction: str) -> tuple[int, str]:
+    raw = (instruction or "").strip()
+    if not raw:
+        return 0, ""
+
+    token_pattern = r"(?:\d+(?:st|nd|rd|th)?|first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth|last)"
+    patterns = [
+        rf"^\s*(?:add|insert)\s+(?:a\s+new\s+)?(?:meeting\s+summary|summary)\s+(?:point|bullet|item)\s+(?P<position>{token_pattern})\s*(?::|-)?\s*(?P<quote>[\"'`])(?P<text>.+?)(?P=quote)\s*$",
+        rf"^\s*(?:add|insert)\s+(?:a\s+new\s+)?(?:meeting\s+summary|summary)\s+(?:point|bullet|item)\s+(?P<position>{token_pattern})\s*(?::|-)?\s*(?P<text>.+?)\s*$",
+    ]
+    for pattern in patterns:
+        match = re.match(pattern, raw, re.IGNORECASE)
+        if not match:
+            continue
+        position = parse_ordinal_position(match.group("position") or "")
+        item_text = sanitize_text(match.group("text") or "").strip(" \t\r\n")
+        if position == 0 or not item_text:
+            return 0, ""
+        return position, item_text
+    return 0, ""
+
+
+def insert_nth_item_into_section(text_value: str, section_name: str, position: int, item_text: str) -> str:
+    if not text_value or not item_text or position == 0:
+        return text_value
+    lines = (text_value or "").splitlines()
+    start_idx, end_idx = section_range(lines, section_name)
+    if start_idx < 0:
+        return text_value
+
+    item_indices = []
+    for idx in range(start_idx, end_idx):
+        if re.match(r"^\s*(?:[-*]|\d+\.)\s+\S", lines[idx]):
+            item_indices.append(idx)
+
+    if position < 0 or position > len(item_indices) + 1:
+        insert_idx = end_idx
+    elif position <= len(item_indices):
+        insert_idx = item_indices[position - 1]
+    else:
+        insert_idx = end_idx
+
+    lines.insert(insert_idx, f"1. {item_text}")
+    renumber_numbered_lines(lines, start_idx, end_idx + 1)
+    edited = "\n".join(lines)
+    edited = re.sub(r"\n{3,}", "\n\n", edited).strip()
+    return edited
+
+
 def parse_next_step_owner_change_instruction(instruction: str) -> tuple[int, str]:
     lowered = (instruction or "").lower()
     if not lowered:
@@ -1206,6 +1263,12 @@ def apply_structured_summary_edit(summary_text: str, instruction: str, chat_id: 
     lowered = (instruction or "").lower()
     if not lowered:
         return summary_text
+
+    insert_position, insert_text = parse_summary_point_insert_instruction(instruction)
+    if insert_position:
+        updated = insert_nth_item_into_section(summary_text, "meeting summary", insert_position, insert_text)
+        if updated != summary_text:
+            return updated
 
     owner_position, owner_text = parse_next_step_owner_change_instruction(instruction)
     if owner_position:
