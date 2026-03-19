@@ -2457,17 +2457,26 @@ def sync_cached_meeting_summary_after_edit(original_summary: str, edited_summary
     return True
 
 
-def meeting_request_mode(text: str) -> str:
-    lowered = (text or "").lower()
-    has_url = bool(extract_minutes_url(text))
-    next_steps_hint = any(phrase in lowered for phrase in ["next steps", "action items", "todos", "todo", "下一步", "待办", "待辦"])
-    summary_hint = looks_like_summary_request(text)
+def parse_explicit_meeting_command(text: str) -> tuple[str, str]:
+    raw = (text or "").strip()
+    if not raw:
+        return "", ""
 
-    if next_steps_hint and has_url:
-        return "next_steps"
-    if summary_hint and has_url:
-        return "summary"
-    return ""
+    summary_match = re.match(
+        r"^Summarize:\s*(https?://[^\s]+/minutes/[A-Za-z0-9]+[^\s]*)\s*$",
+        raw,
+    )
+    if summary_match:
+        return "summary", summary_match.group(1).rstrip(").,]")
+
+    next_steps_match = re.match(
+        r"^Next steps:\s*(https?://[^\s]+/minutes/[A-Za-z0-9]+[^\s]*)\s*$",
+        raw,
+    )
+    if next_steps_match:
+        return "next_steps", next_steps_match.group(1).rstrip(").,]")
+
+    return "", ""
 
 
 def lark_auth_headers() -> dict:
@@ -4247,10 +4256,6 @@ def extract_meeting_owner_candidates(minute_meta: dict) -> list[dict]:
     return out
 
 
-def choose_meeting_url_for_request(chat_id: str, request_text: str, requester_open_id: str, requester_name: str) -> str:
-    return extract_minutes_url(request_text)
-
-
 def build_meeting_reply(chat_id: str, request_text: str, minute_url: str, mode: str) -> tuple[str, str]:
     minute_token = extract_minutes_token(minute_url)
     if not minute_token:
@@ -5020,24 +5025,8 @@ def webhook():
                 app.logger.exception("Failed to send learn prompt")
             continue
 
-        meeting_mode = meeting_request_mode(seg)
+        meeting_mode, meeting_url = parse_explicit_meeting_command(seg)
         if meeting_mode:
-            meeting_url = choose_meeting_url_for_request(chat_id, seg, sender_open_id, sender_name)
-            if not meeting_url:
-                try:
-                    missing_meeting = "I couldn't find a recent meeting transcript link in this chat yet."
-                    msg_id = send_lark_text_reply(
-                        message_id,
-                        missing_meeting,
-                        mention_open_id=sender_open_id,
-                        mention_name=sender_name,
-                    )
-                    remember_bot_message(msg_id, chat_id)
-                    save_bot_text(chat_id, missing_meeting, root_id, message_id, event_message_id=msg_id)
-                except Exception:
-                    app.logger.exception("Failed to send missing-meeting-link reply")
-                continue
-
             try:
                 minute_token = extract_minutes_token(meeting_url)
                 cached = load_cached_meeting_summary(minute_token, meeting_mode) if minute_token else None
@@ -5098,6 +5087,9 @@ def webhook():
                 except Exception:
                     app.logger.exception("Failed to send meeting-unavailable reply")
                 continue
+        elif extract_minutes_url(seg):
+            app.logger.info("Ignoring minutes URL without strict meeting command format: %s", seg[:220])
+            continue
 
         elif looks_like_summary_request(seg):
             window = parse_time_window(seg, user_tz)
