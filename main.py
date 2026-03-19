@@ -2460,72 +2460,14 @@ def sync_cached_meeting_summary_after_edit(original_summary: str, edited_summary
 def meeting_request_mode(text: str) -> str:
     lowered = (text or "").lower()
     has_url = bool(extract_minutes_url(text))
-    has_meeting_hint = any(word in lowered for word in ["meeting", "minutes", "transcript", "会议", "會議", "纪要", "紀要"])
     next_steps_hint = any(phrase in lowered for phrase in ["next steps", "action items", "todos", "todo", "下一步", "待办", "待辦"])
     summary_hint = looks_like_summary_request(text)
 
-    if next_steps_hint and (has_url or has_meeting_hint):
+    if next_steps_hint and has_url:
         return "next_steps"
-    if has_url:
-        return "summary"
-    if summary_hint and has_meeting_hint:
+    if summary_hint and has_url:
         return "summary"
     return ""
-
-
-def prefers_requester_owned_recent_meeting(text: str) -> bool:
-    lowered = (text or "").lower()
-    explicit_phrases = [
-        "my previous meeting",
-        "my last meeting",
-        "my latest meeting",
-        "my recent meeting",
-        "meeting i owned",
-        "meeting i was the owner of",
-        "meeting i hosted",
-        "meeting i organized",
-        "meeting i organised",
-        "meeting i led",
-    ]
-    implicit_recent_phrases = [
-        "previous meeting",
-        "last meeting",
-        "latest meeting",
-        "recent meeting",
-    ]
-    return any(phrase in lowered for phrase in explicit_phrases + implicit_recent_phrases)
-
-
-def recent_meeting_urls(chat_id: str, scan_limit: int = 80, unique_limit: int = 12) -> list[str]:
-    rows = db_query_all(
-        """
-        SELECT text_content
-        FROM messages
-        WHERE chat_id = :chat_id
-          AND text_content IS NOT NULL
-          AND text_content <> ''
-        ORDER BY created_at_ts DESC
-        LIMIT :limit_rows
-        """,
-        {"chat_id": chat_id, "limit_rows": scan_limit},
-    )
-
-    urls: list[str] = []
-    seen: set[str] = set()
-    for row in rows:
-        url = extract_minutes_url(row.get("text_content") or "")
-        if not url or url in seen:
-            continue
-        seen.add(url)
-        urls.append(url)
-        if len(urls) >= unique_limit:
-            break
-    return urls
-
-
-def find_last_meeting_url(chat_id: str, limit: int = 80) -> str:
-    urls = recent_meeting_urls(chat_id, scan_limit=limit, unique_limit=1)
-    return urls[0] if urls else ""
 
 
 def lark_auth_headers() -> dict:
@@ -4305,60 +4247,8 @@ def extract_meeting_owner_candidates(minute_meta: dict) -> list[dict]:
     return out
 
 
-def minute_owned_by_requester(minute_meta: dict, requester_open_id: str, requester_name: str) -> bool:
-    clean_requester_id = (requester_open_id or "").strip()
-    clean_requester_name = sanitize_text(requester_name or "")
-    for candidate in extract_meeting_owner_candidates(minute_meta):
-        owner_open_id = (candidate.get("open_id") or "").strip()
-        owner_name = (candidate.get("name") or "").strip()
-        if clean_requester_id and owner_open_id and owner_open_id == clean_requester_id:
-            return True
-        if clean_requester_name and owner_name and person_name_matches(owner_name, clean_requester_name):
-            return True
-    return False
-
-
-def find_last_requester_owned_meeting_url(
-    chat_id: str,
-    requester_open_id: str,
-    requester_name: str,
-    scan_limit: int = 160,
-    candidate_limit: int = 12,
-) -> str:
-    if not requester_open_id and not (requester_name or "").strip():
-        return ""
-
-    for meeting_url in recent_meeting_urls(chat_id, scan_limit=scan_limit, unique_limit=candidate_limit):
-        minute_token = extract_minutes_token(meeting_url)
-        if not minute_token:
-            continue
-        try:
-            minute_meta = fetch_lark_minute_meta(minute_token)
-        except Exception:
-            app.logger.warning("Requester-owned meeting lookup skipped meta fetch: token=%s", minute_token)
-            continue
-        if minute_owned_by_requester(minute_meta, requester_open_id, requester_name):
-            app.logger.info(
-                "Requester-owned meeting selected: chat_id=%s token=%s requester=%s",
-                chat_id,
-                minute_token,
-                requester_name,
-            )
-            return meeting_url
-    return ""
-
-
 def choose_meeting_url_for_request(chat_id: str, request_text: str, requester_open_id: str, requester_name: str) -> str:
-    direct_url = extract_minutes_url(request_text)
-    if direct_url:
-        return direct_url
-
-    if prefers_requester_owned_recent_meeting(request_text):
-        owned_url = find_last_requester_owned_meeting_url(chat_id, requester_open_id, requester_name)
-        if owned_url:
-            return owned_url
-
-    return find_last_meeting_url(chat_id)
+    return extract_minutes_url(request_text)
 
 
 def build_meeting_reply(chat_id: str, request_text: str, minute_url: str, mode: str) -> tuple[str, str]:
@@ -4535,27 +4425,6 @@ def send_missing_history_message(reply_to_message_id: str, chat_id: str):
     )
     remember_bot_message(msg_id, chat_id)
     save_bot_text(chat_id, text, None, reply_to_message_id, event_message_id=msg_id)
-
-
-def is_authorized_meeting_requester(sender_open_id: str, sender_name: str, profile: dict | None = None) -> bool:
-    clean_sender_id = (sender_open_id or "").strip()
-    expected_name = (THOMAS_DISPLAY_NAME or "Thomas").strip() or "Thomas"
-    profile_name = ((profile or {}).get("display_name") or "").strip()
-    name_match = person_name_matches(sender_name, expected_name) or person_name_matches(profile_name, expected_name)
-
-    if THOMAS_OPEN_ID:
-        if clean_sender_id:
-            return clean_sender_id == THOMAS_OPEN_ID
-        if name_match:
-            app.logger.warning(
-                "Meeting requester missing sender_open_id; allowing via Thomas name fallback sender_name=%s profile_name=%s",
-                sender_name,
-                profile_name,
-            )
-            return True
-        return False
-
-    return name_match
 
 
 def looks_like_cjk(text: str) -> bool:
@@ -5153,16 +5022,6 @@ def webhook():
 
         meeting_mode = meeting_request_mode(seg)
         if meeting_mode:
-            if not is_authorized_meeting_requester(sender_open_id, sender_name, profile):
-                app.logger.warning(
-                    "Skipping meeting request from non-authorized sender: chat_id=%s sender_open_id=%s sender_name=%s profile_name=%s mode=%s",
-                    chat_id,
-                    sender_open_id,
-                    sender_name,
-                    (profile.get("display_name") or "").strip(),
-                    meeting_mode,
-                )
-                continue
             meeting_url = choose_meeting_url_for_request(chat_id, seg, sender_open_id, sender_name)
             if not meeting_url:
                 try:
