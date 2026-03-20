@@ -657,10 +657,28 @@ def parse_summary_edit_instruction(text_value: str) -> str:
         return sanitize_text(match.group(1) or "")
 
     direct_text = sanitize_text(text_value or "")
+    lowered = direct_text.lower()
     if re.match(
-        r"^\s*(?:add|insert)\s+(?:a\s+new\s+)?(?:meeting\s+summary|summary)\s+(?:point|bullet|item)\b",
+        r"^\s*(?:add|insert)\s+(?:a\s+new\s+)?(?:meeting\s+summary|meeting\s+note|summary)\s+(?:point|bullet|item)\b",
         direct_text,
         re.IGNORECASE,
+    ):
+        return direct_text
+    if re.match(r"^\s*(?:remove|delete|drop)\b", direct_text, re.IGNORECASE) and (
+        "next step" in lowered
+        or "action item" in lowered
+        or "todo" in lowered
+        or "meeting summary" in lowered
+        or "meeting note" in lowered
+        or "summary point" in lowered
+        or "summary bullet" in lowered
+        or "summary item" in lowered
+    ):
+        return direct_text
+    if (
+        "owner" in lowered
+        and "next step" in lowered
+        and any(token in lowered for token in ["change", "set", "update", "assign", "replace"])
     ):
         return direct_text
     return ""
@@ -1131,8 +1149,8 @@ def parse_summary_point_insert_instruction(instruction: str) -> tuple[int, str]:
 
     token_pattern = r"(?:\d+(?:st|nd|rd|th)?|first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth|last)"
     patterns = [
-        rf"^\s*(?:add|insert)\s+(?:a\s+new\s+)?(?:meeting\s+summary|summary)\s+(?:point|bullet|item)\s+(?P<position>{token_pattern})\s*(?::|-)?\s*(?P<quote>[\"'`])(?P<text>.+?)(?P=quote)\s*$",
-        rf"^\s*(?:add|insert)\s+(?:a\s+new\s+)?(?:meeting\s+summary|summary)\s+(?:point|bullet|item)\s+(?P<position>{token_pattern})\s*(?::|-)?\s*(?P<text>.+?)\s*$",
+        rf"^\s*(?:add|insert)\s+(?:a\s+new\s+)?(?:meeting\s+summary|meeting\s+note|summary)\s+(?:point|bullet|item)\s+(?P<position>{token_pattern})\s*(?::|-)?\s*(?P<quote>[\"'`])(?P<text>.+?)(?P=quote)\s*$",
+        rf"^\s*(?:add|insert)\s+(?:a\s+new\s+)?(?:meeting\s+summary|meeting\s+note|summary)\s+(?:point|bullet|item)\s+(?P<position>{token_pattern})\s*(?::|-)?\s*(?P<text>.+?)\s*$",
     ]
     for pattern in patterns:
         match = re.match(pattern, raw, re.IGNORECASE)
@@ -1289,7 +1307,7 @@ def apply_structured_summary_edit(summary_text: str, instruction: str, chat_id: 
         if edited != summary_text:
             return edited
 
-    if "meeting summary" in lowered or "summary bullet" in lowered or "summary point" in lowered:
+    if "meeting summary" in lowered or "meeting note" in lowered or "summary bullet" in lowered or "summary point" in lowered:
         edited = remove_nth_item_from_section(summary_text, "meeting summary", position)
         if edited != summary_text:
             return edited
