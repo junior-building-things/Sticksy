@@ -1076,6 +1076,42 @@ def section_range(lines: list[str], target_section: str) -> tuple[int, int]:
     return start_idx, end_idx
 
 
+def canonical_section_header(section_name: str) -> str:
+    if section_name == "meeting summary":
+        return "Meeting summary:"
+    if section_name == "next steps":
+        return "Next steps:"
+    return f"{section_name.title()}:"
+
+
+def extract_section_text(text_value: str, section_name: str) -> str:
+    lines = (text_value or "").splitlines()
+    start_idx, end_idx = section_range(lines, section_name)
+    if start_idx < 0:
+        return ""
+    section_lines = [canonical_section_header(section_name)]
+    section_lines.extend(lines[start_idx:end_idx])
+    return "\n".join(section_lines).strip()
+
+
+def replace_section_text(text_value: str, section_name: str, replacement_text: str) -> str:
+    lines = (text_value or "").splitlines()
+    start_idx, end_idx = section_range(lines, section_name)
+    if start_idx < 0:
+        return text_value
+
+    replacement_section = extract_section_text(replacement_text, section_name)
+    if not replacement_section:
+        return text_value
+
+    replacement_lines = replacement_section.splitlines()
+    header_idx = max(0, start_idx - 1)
+    lines[header_idx:end_idx] = replacement_lines
+    edited = "\n".join(lines)
+    edited = re.sub(r"\n{3,}", "\n\n", edited).strip()
+    return edited
+
+
 def renumber_numbered_lines(lines: list[str], start_idx: int, end_idx: int):
     counter = 1
     for idx in range(max(0, start_idx), min(len(lines), end_idx)):
@@ -2539,6 +2575,35 @@ def sync_cached_meeting_summary_after_edit(original_summary: str, edited_summary
         cached.get("title") or "Meeting",
         source_chat_id=(cached.get("source_chat_id") or editor_chat_id or ""),
     )
+    cached_token = cached.get("minute_token") or ""
+    cached_title = cached.get("title") or "Meeting"
+    source_chat_id = (cached.get("source_chat_id") or editor_chat_id or "")
+    cached_mode = cached.get("mode") or "summary"
+
+    if cached_token and cached_mode == "summary":
+        next_steps_text = extract_section_text(clean_edited, "next steps")
+        if next_steps_text:
+            save_cached_meeting_summary(
+                cached_token,
+                "next_steps",
+                next_steps_text,
+                cached_title,
+                source_chat_id=source_chat_id,
+            )
+            app.logger.info("Meeting next-steps cache synced from summary edit: token=%s", cached_token)
+    elif cached_token and cached_mode == "next_steps":
+        summary_cached = load_cached_meeting_summary(cached_token, "summary")
+        if summary_cached and (summary_cached.get("reply_text") or "").strip():
+            merged_summary = replace_section_text(summary_cached.get("reply_text") or "", "next steps", clean_edited)
+            if merged_summary and merged_summary != (summary_cached.get("reply_text") or "").strip():
+                save_cached_meeting_summary(
+                    cached_token,
+                    "summary",
+                    merged_summary,
+                    (summary_cached.get("title") or cached_title or "Meeting"),
+                    source_chat_id=((summary_cached.get("source_chat_id") or source_chat_id) or ""),
+                )
+                app.logger.info("Meeting summary cache synced from next-steps edit: token=%s", cached_token)
     app.logger.info(
         "Meeting summary cache synced from edit: token=%s mode=%s",
         cached.get("minute_token") or "",
