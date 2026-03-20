@@ -2413,7 +2413,7 @@ def create_summary(chat_id: str, query: str, asker_name: str, language_hint: str
 
 def extract_minutes_url(text: str) -> str:
     match = re.search(r"https?://[^\s]+/minutes/[A-Za-z0-9]+[^\s]*", text or "", re.IGNORECASE)
-    return match.group(0).rstrip(").,]") if match else ""
+    return match.group(0).rstrip(").,]>") if match else ""
 
 
 def extract_minutes_token(minutes_url: str) -> str:
@@ -2552,19 +2552,18 @@ def parse_explicit_meeting_command(text: str) -> tuple[str, str]:
     if not raw:
         return "", ""
 
-    summary_match = re.match(
-        r"^Summarize:\s*(https?://[^\s]+/minutes/[A-Za-z0-9]+[^\s]*)\s*$",
-        raw,
-    )
-    if summary_match:
-        return "summary", summary_match.group(1).rstrip(").,]")
-
-    next_steps_match = re.match(
-        r"^Next steps:\s*(https?://[^\s]+/minutes/[A-Za-z0-9]+[^\s]*)\s*$",
-        raw,
-    )
-    if next_steps_match:
-        return "next_steps", next_steps_match.group(1).rstrip(").,]")
+    for prefix, mode in [("Summarize:", "summary"), ("Next steps:", "next_steps")]:
+        if not raw.startswith(prefix):
+            continue
+        remainder = raw[len(prefix) :].strip()
+        if not remainder:
+            return "", ""
+        url = extract_minutes_url(remainder)
+        if not url:
+            return "", ""
+        normalized_remainder = remainder.strip()
+        if normalized_remainder in {url, f"<{url}>", f"({url})", f"[{url}]"}:
+            return mode, url
 
     return "", ""
 
