@@ -50,6 +50,10 @@ MAX_MEETING_TRANSCRIPT_CHARS = int(os.environ.get("MAX_MEETING_TRANSCRIPT_CHARS"
 MAX_MEETING_MEDIA_BYTES = int(os.environ.get("MAX_MEETING_MEDIA_BYTES", "18000000"))
 SUMMARY_REWRITE_LOOKBACK_SECONDS = int(os.environ.get("SUMMARY_REWRITE_LOOKBACK_SECONDS", "1800"))
 GLOBAL_LEARN_SCOPE = "__global__"
+MAX_ASSISTANT_CONTEXT_MESSAGES = int(os.environ.get("MAX_ASSISTANT_CONTEXT_MESSAGES", "24"))
+MAX_DOC_LOOKBACK_MESSAGES = int(os.environ.get("MAX_DOC_LOOKBACK_MESSAGES", "80"))
+MAX_DOC_CONTENT_CHARS = int(os.environ.get("MAX_DOC_CONTENT_CHARS", "24000"))
+MAX_DOC_PROMPT_CHARS = int(os.environ.get("MAX_DOC_PROMPT_CHARS", "12000"))
 
 client = genai.Client(api_key=GEMINI_API_KEY)
 
@@ -151,6 +155,35 @@ Rules:
 - next_steps should capture owner-specific action items when the owner is clear.
 - If an owner is unclear, leave owner_name empty rather than guessing.
 - Keep next steps concrete and brief.
+""".strip()
+
+CHAT_REPLY_SYSTEM_PROMPT = """
+You are Sticksy, a helpful Lark assistant.
+Rules:
+- Preserve the user's language.
+- Reply naturally and directly; answer first.
+- Be concise by default, but still complete enough to be useful.
+- If document context is provided, treat it as the primary source for doc-related questions.
+- If the request is vague but a document is provided, summarize the document or answer from it.
+- If the answer is not supported by the provided document context, say so plainly instead of inventing details.
+- Prefer short bullets only when they make the answer easier to scan.
+""".strip()
+
+DOC_COMMENT_INTENT_PROMPT = """
+Decide whether the user is asking the bot to create a comment on a Lark document.
+Return JSON only with this schema:
+{
+  "is_comment_request": true,
+  "comment_text": "string",
+  "quoted_text": "string"
+}
+
+Rules:
+- Set is_comment_request to true only when the user clearly wants a document comment to be posted.
+- comment_text should be the exact comment the bot should post, cleaned up for readability but without changing meaning.
+- quoted_text should be an exact excerpt copied from the provided document content when the request targets a specific passage.
+- If the request does not clearly target a specific passage, return quoted_text as an empty string.
+- Do not invent quoted_text that does not exist in the provided document content.
 """.strip()
 
 
@@ -1766,6 +1799,20 @@ def extract_text_from_rich_content(obj) -> str:
                 name = x.get("user_name") or x.get("name") or ""
                 if isinstance(name, str) and name.strip():
                     parts.append(name.strip())
+            for key in ("href", "url", "default_url"):
+                value = x.get(key)
+                if isinstance(value, str) and value.startswith(("http://", "https://")):
+                    parts.append(value)
+            text_link = x.get("text_link")
+            if isinstance(text_link, dict):
+                value = text_link.get("url")
+                if isinstance(value, str) and value.startswith(("http://", "https://")):
+                    parts.append(value)
+            docs_link = x.get("docs_link")
+            if isinstance(docs_link, dict):
+                value = docs_link.get("url")
+                if isinstance(value, str) and value.startswith(("http://", "https://")):
+                    parts.append(value)
             for v in x.values():
                 walk(v)
         elif isinstance(x, list):
@@ -2032,6 +2079,15 @@ class TimeWindow:
     start_ts: int
     end_ts: int
     label: str
+
+
+@dataclass
+class LarkDocReference:
+    url: str
+    file_type: str
+    token: str
+    title: str = ""
+    source_kind: str = ""
 
 
 def parse_time_window(query: str, user_tz: str) -> TimeWindow:
@@ -2329,6 +2385,498 @@ def extract_minutes_url(text: str) -> str:
 def extract_minutes_token(minutes_url: str) -> str:
     match = re.search(r"/minutes/([A-Za-z0-9]+)", minutes_url or "", re.IGNORECASE)
     return match.group(1) if match else ""
+
+
+def extract_lark_doc_urls(text: str) -> list[str]:
+    urls = []
+    seen = set()
+    for match in re.finditer(r"https?://[^\s]+/(?:docx|docs|wiki)/[A-Za-z0-9]+[^\s]*", text or "", re.IGNORECASE):
+        url = match.group(0).rstrip(").,]")
+        if url and url not in seen:
+            seen.add(url)
+            urls.append(url)
+    return urls
+
+
+def parse_lark_doc_reference(url: str) -> LarkDocReference | None:
+    match = re.search(r"https?://[^\s]+/(docx|docs|wiki)/([A-Za-z0-9]+)", url or "", re.IGNORECASE)
+    if not match:
+        return None
+    kind = (match.group(1) or "").lower()
+    token = (match.group(2) or "").strip()
+    if not token:
+        return None
+    if kind == "docx":
+        return LarkDocReference(url=url, file_type="docx", token=token, source_kind="docx")
+    if kind == "docs":
+        return LarkDocReference(url=url, file_type="doc", token=token, source_kind="doc")
+    if kind == "wiki":
+        return LarkDocReference(url=url, file_type="wiki", token=token, source_kind="wiki")
+    return None
+
+
+def resolve_lark_doc_reference(ref: LarkDocReference | None) -> LarkDocReference | None:
+    if not ref:
+        return None
+    if ref.file_type in {"doc", "docx"}:
+        return ref
+    if ref.file_type != "wiki":
+        return None
+
+    try:
+        resp = requests.get(
+            "https://open.larkoffice.com/open-apis/wiki/v2/spaces/get_node",
+            headers=lark_headers(),
+            params={"token": ref.token},
+            timeout=HTTP_TIMEOUT,
+        )
+        if resp.status_code >= 400:
+            app.logger.warning("Wiki node lookup failed status=%s url=%s", resp.status_code, ref.url)
+            return None
+        body = resp.json()
+        if body.get("code", 0) != 0:
+            app.logger.warning(
+                "Wiki node lookup api error code=%s msg=%s url=%s",
+                body.get("code"),
+                body.get("msg"),
+                ref.url,
+            )
+            return None
+        node = ((body.get("data") or {}).get("node") or {})
+        obj_token = (node.get("obj_token") or "").strip()
+        obj_type = (node.get("obj_type") or "").strip().lower()
+        if obj_type not in {"doc", "docx"} or not obj_token:
+            app.logger.warning("Wiki node unsupported obj_type=%s url=%s", obj_type, ref.url)
+            return None
+        return LarkDocReference(
+            url=ref.url,
+            file_type=obj_type,
+            token=obj_token,
+            title=(node.get("title") or "").strip(),
+            source_kind="wiki",
+        )
+    except Exception:
+        app.logger.exception("Wiki node lookup exception url=%s", ref.url)
+        return None
+
+
+def fetch_docx_title(document_id: str) -> str:
+    if not document_id:
+        return ""
+    try:
+        resp = requests.get(
+            f"https://open.larkoffice.com/open-apis/docx/v1/documents/{document_id}",
+            headers=lark_headers(),
+            timeout=HTTP_TIMEOUT,
+        )
+        if resp.status_code >= 400:
+            return ""
+        body = resp.json()
+        if body.get("code", 0) != 0:
+            return ""
+        data = body.get("data") or {}
+        doc = data.get("document") if isinstance(data.get("document"), dict) else data
+        return (doc.get("title") or doc.get("document_title") or "").strip()
+    except Exception:
+        app.logger.exception("Docx title lookup failed document_id=%s", document_id)
+        return ""
+
+
+def fetch_lark_doc_content(ref: LarkDocReference | None) -> dict | None:
+    resolved = resolve_lark_doc_reference(ref)
+    if not resolved:
+        return None
+
+    if resolved.file_type == "docx":
+        url = f"https://open.larkoffice.com/open-apis/docx/v1/documents/{resolved.token}/raw_content"
+    elif resolved.file_type == "doc":
+        url = f"https://open.larkoffice.com/open-apis/doc/v2/{resolved.token}/raw_content"
+    else:
+        return None
+
+    try:
+        resp = requests.get(url, headers=lark_headers(), timeout=HTTP_TIMEOUT)
+        if resp.status_code >= 400:
+            app.logger.warning("Doc content fetch failed status=%s url=%s", resp.status_code, resolved.url)
+            return None
+        body = resp.json()
+        if body.get("code", 0) != 0:
+            app.logger.warning(
+                "Doc content api error code=%s msg=%s url=%s",
+                body.get("code"),
+                body.get("msg"),
+                resolved.url,
+            )
+            return None
+        content = ((body.get("data") or {}).get("content") or "").strip()
+        if not content:
+            return None
+        if len(content) > MAX_DOC_CONTENT_CHARS:
+            content = content[:MAX_DOC_CONTENT_CHARS]
+        title = resolved.title or (fetch_docx_title(resolved.token) if resolved.file_type == "docx" else "")
+        return {
+            "url": resolved.url,
+            "file_type": resolved.file_type,
+            "token": resolved.token,
+            "title": title,
+            "content": content,
+        }
+    except Exception:
+        app.logger.exception("Doc content fetch exception url=%s", resolved.url)
+        return None
+
+
+def recent_doc_references(chat_id: str, root_id: str | None = None, limit: int = MAX_DOC_LOOKBACK_MESSAGES) -> list[LarkDocReference]:
+    refs: list[LarkDocReference] = []
+    seen = set()
+
+    queries = []
+    params = {"chat_id": chat_id, "limit_rows": limit}
+    if root_id:
+        queries.append(
+            (
+                """
+                SELECT text_content
+                FROM messages
+                WHERE chat_id = :chat_id
+                  AND root_id = :root_id
+                  AND text_content IS NOT NULL
+                  AND text_content <> ''
+                ORDER BY created_at_ts DESC
+                LIMIT :limit_rows
+                """,
+                {**params, "root_id": root_id},
+            )
+        )
+    queries.append(
+        (
+            """
+            SELECT text_content
+            FROM messages
+            WHERE chat_id = :chat_id
+              AND text_content IS NOT NULL
+              AND text_content <> ''
+            ORDER BY created_at_ts DESC
+            LIMIT :limit_rows
+            """,
+            params,
+        )
+    )
+
+    for sql, sql_params in queries:
+        for row in db_query_all(sql, sql_params):
+            for url in extract_lark_doc_urls(row.get("text_content") or ""):
+                if url in seen:
+                    continue
+                seen.add(url)
+                ref = parse_lark_doc_reference(url)
+                if ref:
+                    refs.append(ref)
+        if refs:
+            break
+
+    return refs
+
+
+def choose_doc_for_request(chat_id: str, root_id: str | None, request_text: str) -> dict | None:
+    for url in extract_lark_doc_urls(request_text):
+        doc = fetch_lark_doc_content(parse_lark_doc_reference(url))
+        if doc:
+            return doc
+
+    for ref in recent_doc_references(chat_id, root_id=root_id, limit=MAX_DOC_LOOKBACK_MESSAGES):
+        doc = fetch_lark_doc_content(ref)
+        if doc:
+            return doc
+    return None
+
+
+def extract_query_terms(text: str) -> list[str]:
+    seen = set()
+    terms = []
+    for token in re.findall(r"[A-Za-z0-9_]{3,}|[\u4e00-\u9fff]{2,}", (text or "").lower()):
+        if token in seen:
+            continue
+        seen.add(token)
+        terms.append(token)
+    return terms
+
+
+def select_relevant_doc_excerpt(doc_text: str, query: str, max_chars: int = MAX_DOC_PROMPT_CHARS) -> str:
+    clean = (doc_text or "").strip()
+    if len(clean) <= max_chars:
+        return clean
+
+    terms = extract_query_terms(query)
+    chunks = [chunk.strip() for chunk in re.split(r"\n{2,}", clean) if chunk.strip()]
+    if not chunks:
+        return clean[:max_chars]
+
+    if not terms:
+        return clean[:max_chars]
+
+    scored: list[tuple[int, int, str]] = []
+    for idx, chunk in enumerate(chunks):
+        lowered = chunk.lower()
+        score = sum(1 for term in terms if term in lowered)
+        if score > 0:
+            scored.append((score, idx, chunk))
+    if not scored:
+        return clean[:max_chars]
+
+    scored.sort(key=lambda item: (-item[0], item[1]))
+    selected = []
+    seen_idx = set()
+    total = 0
+    for _, idx, _ in scored:
+        for candidate_idx in (idx - 1, idx, idx + 1):
+            if candidate_idx < 0 or candidate_idx >= len(chunks) or candidate_idx in seen_idx:
+                continue
+            chunk = chunks[candidate_idx]
+            extra = len(chunk) + (2 if selected else 0)
+            if total + extra > max_chars:
+                continue
+            seen_idx.add(candidate_idx)
+            selected.append((candidate_idx, chunk))
+            total += extra
+        if total >= max_chars * 0.8:
+            break
+    if not selected:
+        return clean[:max_chars]
+    selected.sort(key=lambda item: item[0])
+    return "\n\n".join(chunk for _, chunk in selected)
+
+
+def build_assistant_context(chat_id: str, root_id: str | None, exclude_message_id: str | None, limit: int = MAX_ASSISTANT_CONTEXT_MESSAGES) -> list[str]:
+    params = {
+        "chat_id": chat_id,
+        "exclude_event_message_id": exclude_message_id or "",
+        "limit_rows": limit,
+    }
+    sql = """
+        SELECT sender_name, is_from_bot, text_content, created_at_ts
+        FROM messages
+        WHERE chat_id = :chat_id
+          AND (event_message_id IS NULL OR event_message_id <> :exclude_event_message_id)
+          AND text_content IS NOT NULL
+          AND text_content <> ''
+    """
+    if root_id:
+        sql += "\n          AND root_id = :root_id"
+        params["root_id"] = root_id
+    sql += "\n        ORDER BY created_at_ts DESC\n        LIMIT :limit_rows"
+
+    rows = db_query_all(sql, params)
+    lines = []
+    for row in reversed(rows):
+        speaker = (row.get("sender_name") or "").strip() or ("Sticksy" if int(row.get("is_from_bot") or 0) == 1 else "Participant")
+        text = (row.get("text_content") or "").strip()
+        if text:
+            lines.append(f"{speaker}: {text}")
+    return lines
+
+
+def looks_like_document_request(text: str, has_doc: bool) -> bool:
+    lowered = (text or "").lower()
+    has_doc_hint = bool(extract_lark_doc_urls(text))
+    if has_doc_hint:
+        return True
+    if any(word in lowered for word in ["conversation", "chat history", "messages", "today", "yesterday", "meeting", "minutes", "transcript"]):
+        return False
+    doc_hints = [
+        "this doc",
+        "this document",
+        "the doc",
+        "the document",
+        "according to",
+        "in the doc",
+        "in this",
+        "summarize this",
+        "summarise this",
+        "read this",
+        "what does it say",
+        "comment on this",
+        "comment on the doc",
+        "add comment",
+        "leave comment",
+        "doc ",
+        "document ",
+        "wiki ",
+        "文档",
+        "文件",
+        "这篇",
+        "这个文档",
+        "评论这",
+        "批注",
+    ]
+    if any(hint in lowered for hint in doc_hints):
+        return True
+    if not has_doc:
+        return False
+    trimmed = sanitize_text(text)
+    if looks_like_summary_request(trimmed) and len(trimmed.split()) <= 6:
+        return True
+    return False
+
+
+def parse_doc_comment_intent(request_text: str, doc_title: str, doc_excerpt: str) -> dict | None:
+    lowered = (request_text or "").lower()
+    if not any(keyword in lowered for keyword in ["comment", "comments", "annotate", "note", "批注", "评论", "留言", "备注"]):
+        return None
+    try:
+        config = types.GenerateContentConfig(
+            system_instruction=DOC_COMMENT_INTENT_PROMPT,
+            response_mime_type="application/json",
+        )
+        resp = client.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=json.dumps(
+                {
+                    "request_text": request_text,
+                    "document_title": doc_title,
+                    "document_excerpt": doc_excerpt,
+                },
+                ensure_ascii=False,
+            ),
+            config=config,
+        )
+        parsed = json.loads((resp.text or "{}").strip() or "{}")
+        if not parsed.get("is_comment_request"):
+            return None
+        return {
+            "comment_text": sanitize_text(parsed.get("comment_text") or ""),
+            "quoted_text": (parsed.get("quoted_text") or "").strip(),
+        }
+    except Exception:
+        app.logger.exception("Doc comment intent parse failed")
+        return None
+
+
+def locate_doc_quote(doc_text: str, requested_quote: str) -> str:
+    quote_text = (requested_quote or "").strip()
+    if not quote_text:
+        return ""
+    if quote_text in doc_text:
+        return quote_text
+
+    normalized_doc = re.sub(r"\s+", " ", doc_text or "")
+    normalized_quote = re.sub(r"\s+", " ", quote_text)
+    idx = normalized_doc.lower().find(normalized_quote.lower())
+    if idx < 0:
+        return ""
+    return normalized_doc[idx: idx + len(normalized_quote)].strip()
+
+
+def build_lark_comment_content(comment_text: str) -> dict:
+    clean = (comment_text or "").strip()
+    return {
+        "elements": [
+            {
+                "type": "text_run",
+                "text_run": {"text": clean},
+            }
+        ]
+    }
+
+
+def post_lark_doc_comment(file_token: str, file_type: str, comment_text: str, quote_text: str = "") -> tuple[bool, str]:
+    clean_token = (file_token or "").strip()
+    clean_type = (file_type or "").strip().lower()
+    clean_comment = (comment_text or "").strip()
+    clean_quote = (quote_text or "").strip()
+    if not clean_token or clean_type not in {"doc", "docx"} or not clean_comment:
+        return False, ""
+
+    params = {"file_type": clean_type}
+    payload = {
+        "content": build_lark_comment_content(clean_comment),
+        "is_whole": not bool(clean_quote),
+    }
+    if clean_quote:
+        payload["quote"] = clean_quote
+
+    try:
+        resp = requests.post(
+            f"https://open.larkoffice.com/open-apis/drive/v1/files/{clean_token}/comments",
+            headers=lark_headers(),
+            params=params,
+            json=payload,
+            timeout=HTTP_TIMEOUT,
+        )
+        if resp.status_code < 400:
+            body = resp.json()
+            if body.get("code", 0) == 0:
+                comment_id = ((body.get("data") or {}).get("comment_id") or "").strip()
+                return True, comment_id
+            app.logger.warning(
+                "Doc comment api error code=%s msg=%s token=%s",
+                body.get("code"),
+                body.get("msg"),
+                clean_token,
+            )
+        else:
+            app.logger.warning("Doc comment http error status=%s token=%s", resp.status_code, clean_token)
+    except Exception:
+        app.logger.exception("Doc comment request failed token=%s", clean_token)
+
+    if clean_quote:
+        fallback_payload = {
+            "content": build_lark_comment_content(f'On "{clean_quote}": {clean_comment}'),
+            "is_whole": True,
+        }
+        try:
+            resp = requests.post(
+                f"https://open.larkoffice.com/open-apis/drive/v1/files/{clean_token}/comments",
+                headers=lark_headers(),
+                params=params,
+                json=fallback_payload,
+                timeout=HTTP_TIMEOUT,
+            )
+            if resp.status_code < 400:
+                body = resp.json()
+                if body.get("code", 0) == 0:
+                    comment_id = ((body.get("data") or {}).get("comment_id") or "").strip()
+                    return True, comment_id
+        except Exception:
+            app.logger.exception("Doc comment fallback failed token=%s", clean_token)
+
+    return False, ""
+
+
+def build_assistant_reply(
+    *,
+    chat_id: str,
+    root_id: str | None,
+    request_text: str,
+    asker_name: str,
+    exclude_message_id: str | None = None,
+    doc_context: dict | None = None,
+) -> str:
+    recent_context = build_assistant_context(chat_id, root_id, exclude_message_id, limit=MAX_ASSISTANT_CONTEXT_MESSAGES)
+    payload = {
+        "request_text": request_text,
+        "asker_name": asker_name,
+        "learned_terms": load_learned_terms(chat_id),
+        "recent_chat_context": recent_context,
+    }
+    if doc_context:
+        payload["document"] = {
+            "title": (doc_context.get("title") or "").strip(),
+            "url": (doc_context.get("url") or "").strip(),
+            "content_excerpt": select_relevant_doc_excerpt(
+                doc_context.get("content") or "",
+                request_text,
+                max_chars=MAX_DOC_PROMPT_CHARS,
+            ),
+        }
+
+    config = types.GenerateContentConfig(system_instruction=CHAT_REPLY_SYSTEM_PROMPT)
+    resp = client.models.generate_content(
+        model=GEMINI_MODEL,
+        contents=json.dumps(payload, ensure_ascii=False),
+        config=config,
+    )
+    return (resp.text or "").strip()
 
 
 def load_cached_meeting_summary(minute_token: str, mode: str) -> dict | None:
@@ -5240,7 +5788,68 @@ def webhook():
                     app.logger.exception("Failed to send meeting-unavailable reply")
                 continue
 
-        elif looks_like_summary_request(seg):
+        doc_context = choose_doc_for_request(chat_id, root_id, seg)
+        doc_request = looks_like_document_request(seg, bool(doc_context))
+        if doc_context:
+            app.logger.info(
+                "Doc context selected: url=%s title=%s type=%s",
+                doc_context.get("url") or "",
+                doc_context.get("title") or "",
+                doc_context.get("file_type") or "",
+            )
+
+        doc_comment_intent = None
+        if doc_context:
+            doc_comment_intent = parse_doc_comment_intent(
+                seg,
+                doc_context.get("title") or "",
+                select_relevant_doc_excerpt(doc_context.get("content") or "", seg, max_chars=MAX_DOC_PROMPT_CHARS),
+            )
+
+        if doc_comment_intent and (doc_comment_intent.get("comment_text") or "").strip():
+            try:
+                matched_quote = locate_doc_quote(doc_context.get("content") or "", doc_comment_intent.get("quoted_text") or "")
+                posted, _comment_id = post_lark_doc_comment(
+                    doc_context.get("token") or "",
+                    doc_context.get("file_type") or "",
+                    doc_comment_intent.get("comment_text") or "",
+                    matched_quote,
+                )
+                if posted:
+                    if matched_quote:
+                        reply_text = f'Added a comment on "{matched_quote}".'
+                    else:
+                        reply_text = "Added the comment to the document."
+                else:
+                    reply_text = "I couldn't add that doc comment just now."
+                msg_id = send_lark_text_reply(
+                    message_id,
+                    reply_text,
+                    mention_open_id=sender_open_id,
+                    mention_name=sender_name,
+                )
+                remember_bot_message(msg_id, chat_id)
+                save_bot_text(chat_id, reply_text, root_id, message_id, event_message_id=msg_id)
+            except Exception:
+                app.logger.exception("Doc comment flow failed")
+            continue
+
+        if doc_request and not doc_context:
+            try:
+                reply_text = "I couldn't find an accessible Lark doc link in this chat yet."
+                msg_id = send_lark_text_reply(
+                    message_id,
+                    reply_text,
+                    mention_open_id=sender_open_id,
+                    mention_name=sender_name,
+                )
+                remember_bot_message(msg_id, chat_id)
+                save_bot_text(chat_id, reply_text, root_id, message_id, event_message_id=msg_id)
+            except Exception:
+                app.logger.exception("Missing-doc reply failed")
+            continue
+
+        if looks_like_summary_request(seg) and not doc_request:
             window = parse_time_window(seg, user_tz)
             rows = load_messages_for_window(chat_id, window.start_ts, window.end_ts, root_id if message.get("root_id") else None)
             if not rows:
@@ -5283,9 +5892,29 @@ def webhook():
                 app.logger.exception("Summary generation/send failed; intentionally silent to user")
                 continue
         else:
-            # Non-summary mention must reply with sticker only; on failure, stay silent.
-            send_sticker_reply(message_id, chat_id, seg, current_message_id=message_id)
-            app.logger.info("Processed sticker flow for segment")
+            try:
+                reply_text = build_assistant_reply(
+                    chat_id=chat_id,
+                    root_id=root_id,
+                    request_text=seg,
+                    asker_name=sender_name,
+                    exclude_message_id=message_id,
+                    doc_context=doc_context if doc_request else None,
+                )
+                if not reply_text:
+                    reply_text = "I couldn't think of a useful reply just now."
+                msg_id = send_lark_text_reply(
+                    message_id,
+                    reply_text,
+                    mention_open_id=sender_open_id,
+                    mention_name=sender_name,
+                )
+                remember_bot_message(msg_id, chat_id)
+                save_bot_text(chat_id, reply_text, root_id, message_id, event_message_id=msg_id)
+                app.logger.info("Processed assistant reply flow")
+            except Exception:
+                app.logger.exception("Assistant reply flow failed")
+                continue
 
     return "", 200
 
