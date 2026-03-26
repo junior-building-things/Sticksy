@@ -434,23 +434,6 @@ def normalize_learning_key(text_value: str) -> str:
     return re.sub(r"\s+", " ", (text_value or "").strip().lower())
 
 
-def is_authorized_summary_requester(sender_open_id: str, sender_name: str, profile: dict | None = None) -> bool:
-    expected_name_key = normalize_person_name(THOMAS_DISPLAY_NAME or "Thomas")
-    candidate_names = {
-        normalize_person_name(sender_name or ""),
-        normalize_person_name((profile or {}).get("display_name") or ""),
-        normalize_person_name((profile or {}).get("name") or ""),
-    }
-    candidate_names.discard("")
-
-    if THOMAS_OPEN_ID:
-        if sender_open_id:
-            return sender_open_id == THOMAS_OPEN_ID
-        return expected_name_key in candidate_names if expected_name_key else False
-
-    return expected_name_key in candidate_names if expected_name_key else False
-
-
 def parse_learning_instruction(text_value: str) -> str:
     match = re.match(r"^\s*learn(?:\s+|:\s*)(.+?)\s*$", text_value or "", re.IGNORECASE)
     if not match:
@@ -5126,32 +5109,6 @@ def webhook():
             continue
 
         edit_instruction = parse_summary_edit_instruction(seg)
-        edit_prompt_request = bool(re.match(r"^\s*edit\s+summary\b", seg, re.IGNORECASE))
-        learning_text = parse_learning_instruction(seg)
-        learn_prompt_request = bool(re.match(r"^\s*learn\b", seg, re.IGNORECASE))
-        meeting_mode, meeting_url = parse_explicit_meeting_command(seg)
-        explicit_meeting_prefix = bool(re.match(r"^\s*(?:Summarize:|Next steps:)", seg))
-        summary_request = looks_like_summary_request(seg)
-        summary_auth_required = bool(
-            edit_instruction
-            or edit_prompt_request
-            or learning_text
-            or learn_prompt_request
-            or meeting_mode
-            or explicit_meeting_prefix
-            or summary_request
-        )
-        if summary_auth_required and not is_authorized_summary_requester(sender_open_id, sender_name, profile):
-            app.logger.warning(
-                "Skipping summary request from non-authorized sender: chat_id=%s message_id=%s sender=%s open_id=%s seg=%s",
-                chat_id,
-                message_id,
-                sender_name,
-                sender_open_id,
-                seg[:220],
-            )
-            continue
-
         if edit_instruction:
             try:
                 original_summary, edited_summary = edit_latest_summary(chat_id, root_id, edit_instruction)
@@ -5173,7 +5130,7 @@ def webhook():
             except Exception:
                 app.logger.exception("Failed to process summary edit")
             continue
-        if edit_prompt_request:
+        if re.match(r"^\s*edit\s+summary\b", seg, re.IGNORECASE):
             try:
                 prompt_text = 'Tell me what to edit after "Edit summary:".'
                 msg_id = send_lark_text_reply(
@@ -5188,6 +5145,7 @@ def webhook():
                 app.logger.exception("Failed to send edit-summary prompt")
             continue
 
+        learning_text = parse_learning_instruction(seg)
         if learning_text:
             try:
                 save_learned_term(chat_id, learning_text, sender_name)
@@ -5206,7 +5164,7 @@ def webhook():
             except Exception:
                 app.logger.exception("Failed to store learned term")
             continue
-        if learn_prompt_request:
+        if re.match(r"^\s*learn\b", seg, re.IGNORECASE):
             try:
                 prompt_text = 'Tell me what to learn after "Learn".'
                 msg_id = send_lark_text_reply(
@@ -5221,6 +5179,7 @@ def webhook():
                 app.logger.exception("Failed to send learn prompt")
             continue
 
+        meeting_mode, meeting_url = parse_explicit_meeting_command(seg)
         if meeting_mode:
             try:
                 minute_token = extract_minutes_token(meeting_url)
@@ -5286,7 +5245,7 @@ def webhook():
             app.logger.info("Ignoring minutes URL without strict meeting command format: %s", seg[:220])
             continue
 
-        elif summary_request:
+        elif looks_like_summary_request(seg):
             window = parse_time_window(seg, user_tz)
             rows = load_messages_for_window(chat_id, window.start_ts, window.end_ts, root_id if message.get("root_id") else None)
             if not rows:
